@@ -195,8 +195,11 @@ def _added_lines(fp):
 
 
 def old_lines_touched(fp, n):
-    """Old-file line numbers removed, plus both neighbours of every insertion."""
+    """Old-file line numbers removed, plus both neighbours of every insertion.
+
+    Returns (touched, removed)."""
     out = set()
+    removed = set()
     for os_, ol, _ns, _nl, body in fp.hunks:
         o = os_ if ol else os_ + 1  # line number of the next old line
         prev_tag = None
@@ -204,6 +207,7 @@ def old_lines_touched(fp, n):
             tag = hl[:1]
             if tag == "-":
                 out.add(o)
+                removed.add(o)
                 o += 1
             elif tag == "+":
                 out.add(o - 1)
@@ -211,7 +215,7 @@ def old_lines_touched(fp, n):
             else:
                 o += 1
             prev_tag = tag
-    return {x for x in out if 1 <= x <= n}
+    return {x for x in out if 1 <= x <= n}, removed
 
 
 class Maps:
@@ -470,7 +474,12 @@ class Selector:
         maps = self.maps
         n = st["n"]
         reg, stmt, regions = st["reg"], st["stmt"], st["regions"]
-        touched = old_lines_touched(fp, n)
+        touched, removed = old_lines_touched(fp, n)
+        # header lines (decorators, def/class signature): they run when the module is
+        # imported, but a change in the body below them does not re-run them
+        header = set()
+        for rg in regions:
+            header.update(range(rg[2], rg[4]))
         added_def = any(c.lstrip().startswith(("def ", "async def ", "class ", "@")) for c in _added_lines(fp))
         if not is_test:
             self.check_removed_names(fp, path, old_text, reg, regions)
@@ -490,14 +499,19 @@ class Selector:
                     return name
             return None
 
-        for ln in touched:
+        for ln in sorted(touched):
             out |= maps.line(path, ln)
             s = stmt[ln - 1]
+            if s in header:
+                # the innermost statement is the def/class itself (a blank or comment
+                # line in a body): no multi-line statement to widen to
+                s = 0
             if s and s < ln:
                 # a multi-line statement: every line from its start up to the change
                 # (e.g. an `and` turned `or` in a later line of an `if (...)` header)
                 out |= maps.lines(path, s, ln)
-            ran_at_import = any(x in at_import for x in range(s if s and s < ln else ln, ln + 1))
+            ran_at_import = any(x in at_import and x not in header
+                                for x in range(s if s and s < ln else ln, ln + 1))
             r = reg[ln - 1]
             if r < 0:  # module level
                 import_time = True
@@ -519,6 +533,10 @@ class Selector:
                         if rg[0] == "c":
                             out |= maps.class_users(path, rg[1])
                     import_time = True
+            elif ln == body - 1 and ln not in removed and ln + 1 in touched:
+                # unchanged last header line, touched only as the neighbour of an
+                # insertion at the top of the body: the body lines carry the change
+                pass
             elif ln < body:  # decorator or signature: affects every call
                 out |= maps.lines(path, body, end)
                 # decorators and defaults are evaluated at import time too

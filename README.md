@@ -14,6 +14,7 @@ Everything is derived from sqlglot at the pinned commit `eb11aec`. No table maps
   - Class-body edits (attributes, `arg_types`, dialect settings and tables) select the tests that use that class or a subclass. Classes that are never instantiated (enums, mixins) widen to the users of every class in the file.
   - Removing a module-level name, or an upper-case class member such as an enum value, that other code still refers to selects every test.
   - Other import-time code (module level, signatures, decorators, new definitions, and function bodies in `import_lines.z`) selects every test that executes code in the module's dialect family or its importers.
+  - A `def`/`class` header line is not itself an import-time trigger when only the body changed: a blank or comment line in a body is not widened to the enclosing `def`, and an insertion right below an unchanged signature counts as a body edit.
   - Test-file edits select the edited test and the test files that import that module.
   - Fixture edits select the tests that open the fixture.
   - Edits that leave the AST unchanged (comments, blank lines) select nothing.
