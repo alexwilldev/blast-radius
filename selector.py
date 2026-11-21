@@ -366,6 +366,18 @@ class _IdentityToEquality(ast.NodeTransformer):
         return node
 
 
+def _is_eq_rewrite(fp):
+    """Cheap text test: do the removed lines read as the added ones once `is not`/`is`
+    become `!=`/`==`? Only then is the full AST comparison worth its cost."""
+    def norm(lines):
+        return [re.sub(r"\bis\b", "==", c.replace(" is not ", " != ")).strip() for c in lines]
+    removed = [hl[1:] for _o, _l, _n, _m, body in fp.hunks for hl in body if hl[:1] == "-"]
+    added = list(_added_lines(fp))
+    if not removed or len(removed) != len(added) or not any(" is " in c for c in removed + added):
+        return False
+    return norm(removed) == norm(added)
+
+
 def _equivalent(a, b):
     """Same program up to `is`/`is not` vs `==`/`!=` against None or an Enum member."""
     try:
@@ -571,7 +583,7 @@ class Selector:
         if all((not c.strip()) or c.strip().startswith("#") for c in _changed_lines(fp)):
             if _ast_equal(old_text, new_text):
                 return 0
-        elif any(" is " in c or "==" in c or "!=" in c for c in _changed_lines(fp)):
+        elif _is_eq_rewrite(fp):
             if _equivalent(old_text, new_text):
                 return 0
         try:
