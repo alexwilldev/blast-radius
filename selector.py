@@ -9,6 +9,7 @@ Method (all maps are built from sqlglot at the pinned commit, never from patches
   attributed to the test that submitted it.
 - maps/fixtures.json: which tests open which fixture file.
 - maps/import_lines.z: lines executed just by importing every module.
+- maps/usage.*: which tests instantiate (or look up as a dialect) each class.
 - /app/struct (built in the Dockerfile): def/class/statement spans per file and
   the static import graph.
 A changed line selects the tests that execute it or its enclosing statement.
@@ -225,6 +226,8 @@ class Maps:
         self._file_union = {}
         self._set_cache = {}
         self._import_lines = None
+        self._usage = None
+        self._usage_sets = None
 
     @property
     def idx(self):
@@ -267,6 +270,17 @@ class Maps:
             p = STRUCT / (path + ".json")
             self._struct[path] = json.loads(p.read_text()) if p.exists() else None
         return self._struct[path]
+
+    def class_users(self, path, qualname):
+        """Tests that instantiated (or looked up as a dialect) this class or a subclass."""
+        if self._usage is None:
+            self._usage = json.loads(zlib.decompress((MAPS / "usage.idx").read_bytes()))
+            self._usage_sets = (MAPS / "usage.sets").read_bytes()
+        sid = self._usage.get(f"{path}::{qualname}")
+        if sid is None:
+            return 0
+        nb = self.nbytes
+        return int.from_bytes(self._usage_sets[sid * nb:(sid + 1) * nb], "little")
 
     def import_lines(self, path):
         """Lines executed just by importing every module (no test running)."""
@@ -413,6 +427,19 @@ class Selector:
         out = 0
         import_time = added_def
         at_import = set(maps.import_lines(path))
+        class_names = {rg[1] for rg in regions if rg[0] == "c"}
+        classes_hit = set()
+
+        def enclosing_class(r):
+            name = regions[r][1]
+            if regions[r][0] == "c":
+                return name
+            while "." in name:
+                name = name.rsplit(".", 1)[0]
+                if name in class_names:
+                    return name
+            return None
+
         for ln in touched:
             out |= maps.line(path, ln)
             s = stmt[ln - 1]
@@ -420,20 +447,31 @@ class Selector:
                 # a multi-line statement: every line from its start up to the change
                 # (e.g. an `and` turned `or` in a later line of an `if (...)` header)
                 out |= maps.lines(path, s, ln)
-            if any(x in at_import for x in range(s if s and s < ln else ln, ln + 1)):
-                # runs while modules are imported (helpers building dialect tables,
-                # metaclasses, templates): its effect outlives any single test
-                import_time = True
+            ran_at_import = any(x in at_import for x in range(s if s and s < ln else ln, ln + 1))
             r = reg[ln - 1]
-            if r < 0:
+            if r < 0:  # module level
                 import_time = True
                 continue
+            cls_name = enclosing_class(r)
+            if cls_name:
+                classes_hit.add(cls_name)
             kind, name, start, end, body = regions[r]
             if kind == "c":
-                import_time = True
+                # class-body state (arg_types, dialect settings, tables) reaches the
+                # tests that use the class or a subclass, wherever the reading code is
+                users = maps.class_users(path, name)
+                if users and not is_test:
+                    out |= users
+                else:
+                    import_time = True
             elif ln < body:  # decorator or signature: affects every call
                 out |= maps.lines(path, body, end)
                 # decorators and defaults are evaluated at import time too
+                import_time = True
+            elif ran_at_import:
+                # a function body that runs while modules are imported or a dialect
+                # is first set up (table builders, dispatch caches): its effect
+                # outlives any single test
                 import_time = True
             if is_test and kind == "d":
                 # the test function itself, even if coverage never reached the line
@@ -445,6 +483,10 @@ class Selector:
                 if tid in self.by_id:
                     out |= 1 << self.by_id[tid]
         if import_time:
+            # class-level state (arg_types, dialect settings, tables) reaches every
+            # test that uses the class or a subclass, wherever the reading code lives
+            for cls_name in classes_hit:
+                out |= maps.class_users(path, cls_name)
             if is_test:
                 for f in self.importers_closure(path, "tests/"):
                     out |= self.file_tests(f)

@@ -7,10 +7,12 @@ Everything is derived from sqlglot at the pinned commit `eb11aec`. No table maps
 - `maps/coverage.idx` + `maps/coverage.sets`: per-test line coverage of `sqlglot/` and `tests/` (pytest-cov `--cov-context=test`). The suite's `ProcessPoolExecutor`s were run in-process during the coverage run, with pickling kept, so work done in pool workers counts toward the test that submitted it. Identical test sets are stored once as bitsets.
 - `maps/fixtures.json`: which tests open which fixture files (recorded with an `open` audit hook).
 - `maps/import_lines.z`: lines executed just by importing every module and creating each dialect's tokenizer, parser and generator once. These run once per process (dialect tables, dispatch caches), so coverage can't credit them to the tests that depend on them.
+- `maps/usage.idx` + `maps/usage.sets`: which tests instantiate each sqlglot class (or look it up as a dialect), counting every sqlglot class in its MRO. Built in a separate instrumented run of the suite.
 - `build_struct.py` (runs in the Dockerfile): def/class/statement spans and the static import graph of the pinned source.
 - `selector.py`, for each patch:
   - A changed line selects the tests that execute it, or any earlier line of the same multi-line statement.
-  - Import-time code (module level, class bodies, signatures, decorators, new definitions, and any line in `import_lines.z`) selects every test that executes code in the module's dialect family or its importers.
+  - Class-body edits (attributes, `arg_types`, dialect settings and tables) select the tests that use that class or a subclass.
+  - Other import-time code (module level, signatures, decorators, new definitions, and function bodies in `import_lines.z`) selects every test that executes code in the module's dialect family or its importers.
   - Test-file edits select the edited test and the test files that import that module.
   - Fixture edits select the tests that open the fixture.
   - Edits that leave the AST unchanged (comments, blank lines) select nothing.
