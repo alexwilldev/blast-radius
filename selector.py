@@ -314,22 +314,32 @@ def _code_equal(a, b):
                  "co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_exceptiontable"):
         if getattr(a, attr, None) != getattr(b, attr, None):
             return False
-    if a.co_code != b.co_code:
-        # Python 3.13+ class bodies store their own first line number
-        # (`__firstlineno__ = <n>`); a comment above the class shifts only that value
-        if "__firstlineno__" not in a.co_names:
-            return False
+    # Python 3.13+ class bodies store their own first line number
+    # (`__firstlineno__ = <n>`): a comment above the class shifts only that value.
+    # 3.13 loads it from co_consts (LOAD_CONST), later versions from the
+    # instruction itself (LOAD_SMALL_INT); mask it in both places.
+    skip_consts = set()
+    if "__firstlineno__" in a.co_names:
         ia, ib = list(dis.get_instructions(a)), list(dis.get_instructions(b))
         if len(ia) != len(ib):
             return False
         for k, (x, y) in enumerate(zip(ia, ib)):
             if x.opname != y.opname:
                 return False
-            if x.arg != y.arg:
-                nxt = ia[k + 1] if k + 1 < len(ia) else None
-                if not (nxt and nxt.opname == "STORE_NAME" and nxt.argval == "__firstlineno__"):
+            nxt = ia[k + 1] if k + 1 < len(ia) else None
+            lineno_load = nxt is not None and nxt.opname == "STORE_NAME" and nxt.argval == "__firstlineno__"
+            if lineno_load and x.opname == "LOAD_CONST":
+                if x.arg != y.arg:
                     return False
-    return _const_equal(a.co_consts, b.co_consts)
+                skip_consts.add(x.arg)
+            elif x.arg != y.arg and not lineno_load:
+                return False
+    elif a.co_code != b.co_code:
+        return False
+    if len(a.co_consts) != len(b.co_consts):
+        return False
+    return all(i in skip_consts or _const_equal(p, q)
+               for i, (p, q) in enumerate(zip(a.co_consts, b.co_consts)))
 
 
 def _const_equal(x, y):
@@ -563,6 +573,179 @@ def _child_runs(order, texts):
     return os.waitstatus_to_exitcode(status) == 0
 
 
+def _all_module_names():
+    out = []
+    for p in sorted((SRC / "sqlglot").rglob("*.py")):
+        if p.name == "__main__.py":
+            continue
+        parts = list(p.relative_to(SRC).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        out.append(".".join(parts))
+    return out
+
+
+def _state_text(failed):
+    """Deterministic text of every value sqlglot computed while being imported:
+    module and class attributes, function defaults and closures, recursively.
+    Functions and classes count by name (their code is covered by coverage)."""
+    import enum
+    on_path = set()
+    skip_cls = {"__dict__", "__weakref__", "__doc__", "__module__", "__firstlineno__",
+                "__static_attributes__", "__qualname__"}
+
+    def walk(x, depth):
+        t = type(x)
+        if x is None or t in (bool, int, float, str, bytes, complex):
+            return t.__name__ + ":" + repr(x)
+        if isinstance(x, enum.Enum):
+            return "enum:" + t.__qualname__ + "." + x.name
+        if isinstance(x, (types.ModuleType, type)):
+            return "ref:" + getattr(x, "__qualname__", getattr(x, "__name__", "?"))
+        if id(x) in on_path:
+            return "cycle"
+        if depth > 80:
+            return "deep:" + t.__qualname__
+        on_path.add(id(x))
+        try:
+            return inner(x, t, depth + 1)
+        finally:
+            on_path.discard(id(x))
+
+    def inner(x, t, depth):
+        if isinstance(x, types.FunctionType):
+            out = "fn:" + x.__qualname__
+            if (x.__module__ or "").startswith("sqlglot"):
+                out += "(" + walk(x.__defaults__, depth) + walk(x.__kwdefaults__, depth)
+                if x.__closure__:
+                    for cell in x.__closure__:
+                        try:
+                            out += walk(cell.cell_contents, depth)
+                        except ValueError:
+                            out += "empty"
+                out += ")"
+            return out
+        if isinstance(x, (types.BuiltinFunctionType, types.MethodType, property, staticmethod, classmethod)):
+            inner_fn = getattr(x, "__func__", None) or getattr(x, "fget", None)
+            return "callable:" + getattr(x, "__qualname__", t.__qualname__) + (
+                "(" + walk(inner_fn, depth) + ")" if isinstance(inner_fn, types.FunctionType) else "")
+        if t in (list, tuple):
+            items = [walk(v, depth) for v in x]
+            if items and all(isinstance(v, type) for v in x):
+                # classes hash by address, so a tuple built from a set of classes
+                # (an isinstance() tuple) has no stable order: compare as a set
+                items.sort()
+            return t.__name__ + "[" + ",".join(items) + "]"
+        if isinstance(x, (set, frozenset)):
+            return "set{" + ",".join(sorted(walk(v, depth) for v in x)) + "}"
+        if isinstance(x, dict):
+            # dict order can follow the hash seed (built from sets): compare as a mapping
+            return "{" + ",".join(sorted(walk(k, depth) + ":" + walk(v, depth) for k, v in x.items())) + "}"
+        d = getattr(x, "__dict__", None)
+        if not isinstance(d, dict):
+            d = {}
+        for klass in t.__mro__:
+            for s in getattr(klass, "__slots__", ()) or ():
+                if isinstance(s, str) and s not in d and hasattr(x, s):
+                    d[s] = getattr(x, s)
+        if d:
+            return "obj:" + t.__qualname__ + "(" + walk(d, depth) + ")"
+        r = repr(x)
+        return "obj:" + t.__qualname__ + ("" if " at 0x" in r else ":" + r)
+
+    lines = ["failed:" + ",".join(sorted(failed))]
+    for name in sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")):
+        mod = sys.modules[name]
+        for k, v in sorted(vars(mod).items()):
+            if k.startswith("__"):
+                continue
+            if isinstance(v, type) and v.__module__ == name:
+                for ck, cv in sorted(vars(v).items()):
+                    if ck not in skip_cls:
+                        lines.append(f"{name}.{k}.{ck}={walk(cv, 0)}")
+            else:
+                lines.append(f"{name}.{k}={walk(v, 0)}")
+    return "\n".join(lines)
+
+
+def _state_digest_in_child(texts):
+    """Fork; the child imports all of sqlglot from scratch (patched files from `texts`)
+    and sends back a digest of the import-time state. None if the child failed."""
+    import hashlib
+    import importlib
+    import importlib.abc
+    import importlib.util
+    import io
+    import contextlib
+    import signal
+    sys.stdout.flush()
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        code = 3
+        try:
+            os.close(r)
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            signal.alarm(60)
+            for n in [n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")]:
+                del sys.modules[n]
+            if str(SRC) not in sys.path:
+                sys.path.insert(0, str(SRC))
+            sys.dont_write_bytecode = True
+
+            by_name = {}
+
+            class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+                def find_spec(self, name, path, target=None):
+                    rel = name.replace(".", "/")
+                    for cand in (rel + ".py", rel + "/__init__.py"):
+                        if cand in texts:
+                            by_name[name] = cand
+                            sub = [str(SRC / rel)] if cand.endswith("__init__.py") else None
+                            return importlib.util.spec_from_file_location(
+                                name, str(SRC / cand), loader=self, submodule_search_locations=sub)
+                    return None
+
+                def create_module(self, spec):
+                    return None
+
+                def exec_module(self, module):
+                    rel = by_name[module.__name__]
+                    exec(compile(texts[rel], module.__spec__.origin, "exec", dont_inherit=True), module.__dict__)
+
+            if texts:
+                sys.meta_path.insert(0, Finder())
+            failed = []
+            sink = io.StringIO()
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                for m in _all_module_names():
+                    try:
+                        importlib.import_module(m)
+                    except Exception as error:
+                        failed.append(f"{m}:{type(error).__name__}")
+            digest = hashlib.blake2b(_state_text(failed).encode(), digest_size=16).hexdigest()
+            os.write(w, digest.encode())
+            code = 0
+        except BaseException:
+            code = 3
+        finally:
+            os._exit(code)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 256)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    _, status = os.waitpid(pid, 0)
+    if os.waitstatus_to_exitcode(status) != 0 or not data:
+        return None
+    return data.decode()
+
+
 def _import_differential(patched, importers):
     """False only when the patched modules raise and the same run with pristine text does not."""
     paths = sorted(patched)
@@ -736,6 +919,26 @@ class Selector:
         self._import_verdict = verdict
         return verdict
 
+    def _import_state_unchanged(self):
+        """Does importing all of sqlglot with this commit's patch leave every
+        import-time value (module/class attributes, defaults, closures) as it was?"""
+        if getattr(self, "_state_verdict", None) is not None:
+            return self._state_verdict
+        verdict = False
+        patched = {p: t for p, t in getattr(self, "_patched", {}).items()
+                   if p.startswith("sqlglot/") and (SRC / p).exists()}
+        if patched and hasattr(os, "fork"):
+            try:
+                if getattr(Selector, "_pristine_state", None) is None:
+                    Selector._pristine_state = _state_digest_in_child({}) or ""
+                if Selector._pristine_state:
+                    new = _state_digest_in_child(patched)
+                    verdict = new is not None and new == Selector._pristine_state
+            except Exception:
+                verdict = False
+        self._state_verdict = verdict
+        return verdict
+
     def check_removed_names(self, fp, path, old_text, reg, regions):
         """A class- or module-level name that disappears breaks every module that
         refers to it (an enum member, a constant, an imported helper)."""
@@ -831,6 +1034,7 @@ class Selector:
         out = 0
         import_time = added_def
         runs_on_import = added_def
+        strict_import = added_def  # import-time reasons other than "a function body ran at import"
         at_import = set(maps.import_lines(path))
         class_names = {rg[1] for rg in regions if rg[0] == "c"}
         classes_hit = set()
@@ -863,6 +1067,7 @@ class Selector:
                 runs_on_import = True
             if r < 0:  # module level
                 import_time = True
+                strict_import = True
                 runs_on_import = True
                 continue
             cls_name = enclosing_class(r)
@@ -884,6 +1089,7 @@ class Selector:
                         if rg[0] == "c":
                             out |= maps.class_users(path, rg[1])
                     import_time = True
+                    strict_import = True
             elif ln == body - 1 and ln not in removed and ln + 1 in touched:
                 # unchanged last header line, touched only as the neighbour of an
                 # insertion at the top of the body: the body lines carry the change
@@ -892,6 +1098,7 @@ class Selector:
                 out |= maps.lines(path, body, end)
                 # decorators and defaults are evaluated at import time too
                 import_time = True
+                strict_import = True
             elif ran_at_import:
                 # a function body that runs while modules are imported or a dialect
                 # is first set up (table builders, dispatch caches): its effect
@@ -908,6 +1115,12 @@ class Selector:
                     out |= 1 << self.by_id[tid]
         if runs_on_import and not is_test and not self._imports_cleanly():
             raise Unknown("patched module raises when imported")
+        if import_time and not strict_import and not is_test \
+                and not path.endswith("__init__.py") and self._import_state_unchanged():
+            # only function bodies that ran during import changed, and importing
+            # the patched package leaves every import-time value as it was: what
+            # the edit can still change, it changes while tests run (coverage)
+            import_time = False
         if import_time:
             # class-level state (arg_types, dialect settings, tables) reaches every
             # test that uses the class or a subclass, wherever the reading code lives
@@ -951,6 +1164,7 @@ class Selector:
         out = 0
         self._patched = self._patched_texts(files)
         self._import_verdict = None
+        self._state_verdict = None
         for fp in files:
             if fp.binary:
                 raise Unknown("binary")
