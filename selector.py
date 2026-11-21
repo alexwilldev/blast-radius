@@ -3,13 +3,24 @@
 For each patch in /data/commits, decide which sqlglot tests could fail and pack
 them onto workers. Logs go to stderr; stdout carries one JSON line a commit.
 
-v0: provably harmless edits (comment/blank-only Python changes whose AST is
-unchanged) run nothing; fixture-only edits run the test files that load that
-fixture; anything else runs every test, packed as tightly as possible.
+Method (all maps are built from sqlglot at the pinned commit, never from patches):
+- maps/coverage.*: per-test line coverage (pytest-cov contexts) of sqlglot/ and
+  tests/, with the suite's process pools run in-process so their work is
+  attributed to the test that submitted it.
+- maps/fixtures.json: which tests open which fixture file.
+- /app/struct (built in the Dockerfile): def/class/statement spans per file and
+  the static import graph.
+A changed line selects the tests that execute it or its enclosing statement.
+Code that runs at import time (module level, class bodies, signatures, new
+definitions) cannot be attributed by coverage, so it falls back to every test
+that executes any code of the module's dialect family and the modules that
+import it. Edits whose AST is unchanged (comments, blank lines) run nothing.
+Anything not understood runs every test.
 """
 
 import ast
 import json
+import zlib
 import os
 import re
 import sys
@@ -17,6 +28,9 @@ from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/app/src"))  # sqlglot at eb11aec
+APP = Path(os.environ.get("BR_APP", Path(__file__).resolve().parent))
+STRUCT = Path(os.environ.get("BR_STRUCT", APP / "struct"))
+MAPS = APP / "maps"
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 
@@ -152,12 +166,117 @@ def apply_hunks(old_text, hunks):
 
 # ---------------------------------------------------------------- classification
 
+FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
+IMPORT_SENSITIVE = (
+    "tests/test_dialect_imports.py",
+    "tests/test_dialect_entry_points.py",
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+)
+
+
+class Unknown(Exception):
+    """Something we do not understand: run everything."""
+
 
 def _changed_lines(fp):
     for _os, _ol, _ns, _nl, body in fp.hunks:
         for hl in body:
             if hl[:1] in "+-":
                 yield hl[1:]
+
+
+def _added_lines(fp):
+    for _os, _ol, _ns, _nl, body in fp.hunks:
+        for hl in body:
+            if hl[:1] == "+":
+                yield hl[1:]
+
+
+def old_lines_touched(fp, n):
+    """Old-file line numbers removed, plus both neighbours of every insertion."""
+    out = set()
+    for os_, ol, _ns, _nl, body in fp.hunks:
+        o = os_ if ol else os_ + 1  # line number of the next old line
+        prev_tag = None
+        for hl in body:
+            tag = hl[:1]
+            if tag == "-":
+                out.add(o)
+                o += 1
+            elif tag == "+":
+                out.add(o - 1)
+                out.add(o)
+            else:
+                o += 1
+            prev_tag = tag
+    return {x for x in out if 1 <= x <= n}
+
+
+class Maps:
+    def __init__(self, ntests):
+        self.ntests = ntests
+        self.nbytes = (ntests + 7) // 8
+        self._idx = None
+        self._sets = None
+        self._fix = None
+        self._struct = {}
+        self._imports = None
+        self._file_union = {}
+        self._set_cache = {}
+
+    @property
+    def idx(self):
+        if self._idx is None:
+            self._idx = json.loads(zlib.decompress((MAPS / "coverage.idx").read_bytes()))
+        return self._idx
+
+    def bits(self, sid):
+        b = self._set_cache.get(sid)
+        if b is None:
+            if self._sets is None:
+                self._sets = (MAPS / "coverage.sets").read_bytes()
+            nb = self.nbytes
+            b = self._set_cache[sid] = int.from_bytes(self._sets[sid * nb:(sid + 1) * nb], "little")
+        return b
+
+    def line(self, path, line):
+        sid = self.idx.get(path, {}).get(str(line))
+        return 0 if sid is None else self.bits(sid)
+
+    def lines(self, path, start, end):
+        li = self.idx.get(path, {})
+        out = 0
+        for ln in range(start, end + 1):
+            sid = li.get(str(ln))
+            if sid is not None:
+                out |= self.bits(sid)
+        return out
+
+    def file_union(self, path):
+        if path not in self._file_union:
+            out = 0
+            for sid in set(self.idx.get(path, {}).values()):
+                out |= self.bits(sid)
+            self._file_union[path] = out
+        return self._file_union[path]
+
+    def struct(self, path):
+        if path not in self._struct:
+            p = STRUCT / (path + ".json")
+            self._struct[path] = json.loads(p.read_text()) if p.exists() else None
+        return self._struct[path]
+
+    @property
+    def imports(self):
+        if self._imports is None:
+            self._imports = json.loads((STRUCT / "_imports.json").read_text())
+        return self._imports
+
+    @property
+    def fixtures(self):
+        if self._fix is None:
+            self._fix = json.loads((MAPS / "fixtures.json").read_text())
+        return self._fix
 
 
 def _ast_equal(a, b):
@@ -167,75 +286,225 @@ def _ast_equal(a, b):
         return False
 
 
-def python_is_harmless(fp):
-    """Comment/blank-only edit to an existing .py file whose AST is unchanged."""
-    if fp.old is None or fp.new is None or fp.old != fp.new or fp.binary:
-        return False
-    for content in _changed_lines(fp):
-        s = content.strip()
-        if s and not s.startswith("#"):
-            return False
-    src = SRC / fp.old
-    try:
-        old_text = src.read_text()
-    except OSError:
-        return False
-    new_text = apply_hunks(old_text, fp.hunks)
-    if new_text is None:
-        return False
-    return _ast_equal(old_text, new_text)
-
-
 class Selector:
     def __init__(self, tests):
         self.tests = tests
         self.all = [t["number"] for t in tests]
+        self.all_bits = (1 << len(tests)) - 1
         self.by_file = {}
+        self.by_id = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
+            self.by_id[t["id"]] = t["number"]
+        self.maps = Maps(len(tests))
         self._test_src = {}
+
+    # -- helpers -----------------------------------------------------------
+
+    def bits_of(self, numbers):
+        out = 0
+        for n in numbers:
+            out |= 1 << n
+        return out
+
+    def file_tests(self, f):
+        return self.bits_of(self.by_file.get(f, ()))
 
     def _test_file_text(self, f):
         if f not in self._test_src:
             try:
                 self._test_src[f] = (SRC / f).read_text()
             except OSError:
-                self._test_src[f] = None
+                self._test_src[f] = ""
         return self._test_src[f]
 
-    def fixture_tests(self, path):
-        """Test files whose source names this fixture (by relative path or basename)."""
-        rel = path[len("tests/fixtures/"):]
-        base = os.path.basename(path)
-        stem = os.path.splitext(base)[0]
-        out = set()
+    def mentioned_by_tests(self, needles):
+        out = 0
         for f in self.by_file:
             text = self._test_file_text(f)
-            if text is None:
-                return None
-            if rel in text or base in text or (len(stem) > 3 and f'"{stem}' in text):
-                out.update(self.by_file[f])
-        if not out:
-            return None
+            if any(nd in text for nd in needles):
+                out |= self.file_tests(f)
+        return out
+
+    def import_sensitive(self):
+        out = 0
+        for key in IMPORT_SENSITIVE:
+            if key.endswith(".py"):
+                out |= self.file_tests(key)
+            elif key in self.by_id:
+                out |= 1 << self.by_id[key]
+        return out
+
+    def importers_closure(self, path, limit_prefix=None):
+        seen = {path}
+        todo = [path]
+        while todo:
+            cur = todo.pop()
+            for imp in self.maps.imports.get(cur, ()):
+                if imp not in seen and (limit_prefix is None or imp.startswith(limit_prefix)):
+                    seen.add(imp)
+                    todo.append(imp)
+        return seen
+
+    def family(self, path):
+        """Modules whose code shares state with an import-time change in `path`."""
+        parts = path.split("/")
+        mods = {path}
+        if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in FAMILY_DIRS:
+            stem = parts[2]
+            for d in FAMILY_DIRS:
+                cand = f"sqlglot/{d}/{stem}"
+                if self.maps.struct(cand) is not None:
+                    mods.add(cand)
+        # dialect subclasses and helpers living in other files import their parent
+        for m in list(mods):
+            for imp in self.maps.imports.get(m, ()):
+                ip = imp.split("/")
+                if len(ip) == 3 and ip[0] == "sqlglot" and ip[1] in FAMILY_DIRS:
+                    mods.add(imp)
+        return mods
+
+    def family_union(self, path):
+        out = 0
+        for m in self.family(path):
+            out |= self.maps.file_union(m)
+        return out
+
+    # -- per file kinds ----------------------------------------------------
+
+    def python_file(self, fp, is_test):
+        path = fp.old
+        st = self.maps.struct(path)
+        try:
+            old_text = (SRC / path).read_text()
+        except OSError:
+            raise Unknown(path)
+        new_text = apply_hunks(old_text, fp.hunks)
+        if new_text is None:
+            raise Unknown("hunks do not apply")
+        if all((not c.strip()) or c.strip().startswith("#") for c in _changed_lines(fp)):
+            if _ast_equal(old_text, new_text):
+                return 0
+        try:
+            ast.parse(new_text)
+        except (SyntaxError, ValueError):
+            if is_test:
+                out = 0
+                for f in self.importers_closure(path, "tests/"):
+                    out |= self.file_tests(f)
+                return out
+            raise Unknown("syntax error")
+        if st is None:
+            raise Unknown("no structure")
+
+        maps = self.maps
+        n = st["n"]
+        reg, stmt, regions = st["reg"], st["stmt"], st["regions"]
+        touched = old_lines_touched(fp, n)
+        added_def = any(c.lstrip().startswith(("def ", "async def ", "class ", "@")) for c in _added_lines(fp))
+        out = 0
+        import_time = added_def
+        for ln in touched:
+            out |= maps.line(path, ln)
+            s = stmt[ln - 1]
+            if s and s < ln:
+                # a multi-line statement: every line from its start up to the change
+                # (e.g. an `and` turned `or` in a later line of an `if (...)` header)
+                out |= maps.lines(path, s, ln)
+            r = reg[ln - 1]
+            if r < 0:
+                import_time = True
+                continue
+            kind, name, start, end, body = regions[r]
+            if kind == "c":
+                import_time = True
+            elif ln < body:  # decorator or signature: affects every call
+                out |= maps.lines(path, body, end)
+                # decorators and defaults are evaluated at import time too
+                import_time = True
+            if is_test and kind == "d":
+                # the test function itself, even if coverage never reached the line
+                cls = name.rsplit(".", 1)
+                if len(cls) == 2:
+                    tid = f"{path}::{cls[0].replace('.', '::')}::{cls[1]}"
+                else:
+                    tid = f"{path}::{name}"
+                if tid in self.by_id:
+                    out |= 1 << self.by_id[tid]
+        if import_time:
+            if is_test:
+                for f in self.importers_closure(path, "tests/"):
+                    out |= self.file_tests(f)
+                out |= self.family_union(path)
+            else:
+                if path.endswith("__init__.py"):
+                    raise Unknown("package init at import time")
+                out |= self.family_union(path)
+                out |= self.import_sensitive()
+        return out
+
+    def fixture_file(self, fp):
+        path = fp.path
+        opened = self.maps.fixtures.get(path)
+        if opened:
+            return self.bits_of(x for x in opened if isinstance(x, int))
+        rel = path[len("tests/fixtures/"):]
+        return self.mentioned_by_tests((rel, os.path.basename(path)))
+
+    def other_file(self, fp):
+        path = fp.path
+        if path.startswith("sqlglot/") or path.startswith("tests/"):
+            raise Unknown(path)
+        parts = path.split("/")
+        needles = {os.path.basename(path)}
+        if len(parts) > 1:
+            needles.add(parts[0])
+        return self.mentioned_by_tests(needles)
+
+    # -- entry ---------------------------------------------------------------
+
+    def select_bits(self, patch_text):
+        files = parse_patch(patch_text)
+        if not files:
+            raise Unknown("empty patch")
+        out = 0
+        for fp in files:
+            if fp.binary:
+                raise Unknown("binary")
+            path = fp.path or ""
+            if fp.old is None or fp.new is None or fp.old != fp.new:
+                # added, deleted or renamed file
+                if fp.old is None and path.endswith(".py") and path.startswith("sqlglot/"):
+                    out |= self.family_union(path) | self.import_sensitive()
+                    continue
+                if fp.old is None and not path.startswith(("sqlglot/", "tests/")):
+                    out |= self.other_file(fp)
+                    continue
+                raise Unknown("file added/removed/renamed")
+            if path.endswith(".py") and path.startswith("sqlglot/"):
+                out |= self.python_file(fp, is_test=False)
+            elif path.endswith(".py") and path.startswith("tests/"):
+                out |= self.python_file(fp, is_test=True)
+            elif path.startswith("tests/fixtures/"):
+                out |= self.fixture_file(fp)
+            else:
+                out |= self.other_file(fp)
         return out
 
     def select(self, patch_text):
-        files = parse_patch(patch_text)
-        if not files:
-            return set(self.all)
-        chosen = set()
-        for fp in files:
-            path = fp.path or ""
-            if path.endswith(".py") and python_is_harmless(fp):
-                continue
-            if (path.startswith("tests/fixtures/") and fp.old and fp.new
-                    and fp.old == fp.new and not fp.binary):
-                got = self.fixture_tests(path)
-                if got is not None:
-                    chosen |= got
-                    continue
-            return set(self.all)
-        return chosen
+        try:
+            bits = self.select_bits(patch_text)
+        except Unknown as why:
+            log(f"  unknown ({why}): all tests")
+            bits = self.all_bits
+        out = []
+        n = 0
+        while bits:
+            if bits & 1:
+                out.append(n)
+            bits >>= 1
+            n += 1
+        return set(out)
 
 
 # ---------------------------------------------------------------- packing

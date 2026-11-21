@@ -12,6 +12,12 @@ ms=[m for m in t.getmembers() if m.name.split('/')[1:2] in (['sqlglot'],['tests'
 t.extractall('/app/src', members=ms, filter='data')" \
  && test -f /app/src/sqlglot/parser.py && chmod -R a+rX /app
 
+# Structure maps (def/class/statement spans, import graph) from the pinned source.
+COPY build_struct.py /app/build_struct.py
+RUN python /app/build_struct.py /app/src /app/struct
+
+# Coverage and fixture maps built once at the pinned commit (see README).
+COPY maps /app/maps
 COPY selector.py /app/selector.py
-RUN chmod a+r /app/selector.py
+RUN chmod -R a+rX /app
 CMD ["python", "-S", "-E", "/app/selector.py"]

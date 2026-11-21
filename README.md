@@ -1,4 +1,24 @@
-# Blast Radius starter
+# Blast Radius entry
+
+## How this entry selects tests
+
+Everything is derived from sqlglot at the pinned commit `eb11aec`. No table maps patches, or kinds of edit, to tests.
+
+- `maps/coverage.idx` + `maps/coverage.sets`: per-test line coverage of `sqlglot/` and `tests/` (pytest-cov `--cov-context=test`). The suite's `ProcessPoolExecutor`s were run in-process during the coverage run, with pickling kept, so work done in pool workers counts toward the test that submitted it. Identical test sets are stored once as bitsets.
+- `maps/fixtures.json`: which tests open which fixture files (recorded with an `open` audit hook).
+- `build_struct.py` (runs in the Dockerfile): def/class/statement spans and the static import graph of the pinned source.
+- `selector.py`, for each patch:
+  - A changed line selects the tests that execute it, or any earlier line of the same multi-line statement.
+  - Import-time code (module level, class bodies, signatures, decorators, new definitions) selects every test that executes code in the module's dialect family or its importers.
+  - Test-file edits select the edited test and the test files that import that module.
+  - Fixture edits select the tests that open the fixture.
+  - Edits that leave the AST unchanged (comments, blank lines) select nothing.
+  - Anything else not understood selects every test.
+  - Tests are packed onto 1–8 workers to minimise the busiest worker plus 2 s per worker.
+
+---
+
+## Starter kit notes
 
 A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
 
