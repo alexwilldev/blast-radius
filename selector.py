@@ -36,7 +36,8 @@ APP = Path(os.environ.get("BR_APP", Path(__file__).resolve().parent))
 STRUCT = Path(os.environ.get("BR_STRUCT", APP / "struct"))
 MAPS = APP / "maps"
 MAX_WORKERS = 8
-IMPORT_CHECK_FANOUT = 8  # re-run a patched module's importers only when it has this few
+IMPORT_CHECK_FANOUT = 8
+STATE_CHECK_MIN_GAIN_MS = 3000  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
 
 
@@ -288,6 +289,21 @@ class Maps:
             return 0
         nb = self.nbytes
         return int.from_bytes(self._usage_sets[sid * nb:(sid + 1) * nb], "little")
+
+    def attr_readers(self, key):
+        """Tests that read class attribute `key` ("sqlglot/x.py::Cls.ATTR"), from a
+        recorder pass over the pinned suite; None if no recorder stood in for it."""
+        if getattr(self, "_attrs", None) is None:
+            try:
+                self._attrs = json.loads(zlib.decompress((MAPS / "attrs.idx").read_bytes()))
+                self._attrs_sets = (MAPS / "attrs.sets").read_bytes()
+            except OSError:
+                self._attrs = {}
+        sid = self._attrs.get(key)
+        if sid is None:
+            return None
+        nb = self.nbytes
+        return int.from_bytes(self._attrs_sets[sid * nb:(sid + 1) * nb], "little")
 
     def import_lines(self, path):
         """Lines executed just by importing every module (no test running)."""
@@ -585,7 +601,7 @@ def _all_module_names():
     return out
 
 
-def _state_text(failed):
+def _state_items(failed):
     """Deterministic text of every value sqlglot computed while being imported:
     module and class attributes, function defaults and closures, recursively.
     Functions and classes count by name (their code is covered by coverage)."""
@@ -653,25 +669,49 @@ def _state_text(failed):
         r = repr(x)
         return "obj:" + t.__qualname__ + ("" if " at 0x" in r else ":" + r)
 
-    lines = ["failed:" + ",".join(sorted(failed))]
+    import hashlib
+
+    def h(text):
+        return hashlib.blake2b(text.encode(), digest_size=10).hexdigest()
+
+    def kind(v):
+        # "d": plain data a recorder could stand in for; "f": anything callable or a descriptor
+        if isinstance(v, (types.FunctionType, types.BuiltinFunctionType, types.MethodType,
+                          staticmethod, classmethod, property, type, types.ModuleType)):
+            return ":f"
+        if hasattr(type(v), "__get__") or hasattr(type(v), "__set__"):
+            return ":f"
+        return ":d"
+
+    out = {"FAILED": ",".join(sorted(failed))}
     for name in sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")):
         mod = sys.modules[name]
+        f = getattr(mod, "__file__", None) or ""
+        i = f.rfind("/sqlglot/")
+        rel = f[i + 1:] if i >= 0 else name
+        stack = []
         for k, v in sorted(vars(mod).items()):
             if k.startswith("__"):
                 continue
-            if isinstance(v, type) and v.__module__ == name:
-                for ck, cv in sorted(vars(v).items()):
-                    if ck not in skip_cls:
-                        lines.append(f"{name}.{k}.{ck}={walk(cv, 0)}")
+            if isinstance(v, type) and v.__module__ == name and v.__qualname__ == k:
+                stack.append(v)
             else:
-                lines.append(f"{name}.{k}={walk(v, 0)}")
-    return "\n".join(lines)
+                out[f"G|{rel}|{k}"] = h(walk(v, 0)) + kind(v)
+        while stack:
+            c = stack.pop()
+            for ck, cv in sorted(vars(c).items()):
+                if ck in skip_cls:
+                    continue
+                if isinstance(cv, type) and cv.__module__ == name and cv.__qualname__ == f"{c.__qualname__}.{ck}":
+                    stack.append(cv)  # nested class: its own attributes
+                    continue
+                out[f"{rel}::{c.__qualname__}.{ck}"] = h(walk(cv, 0)) + kind(cv)
+    return out
 
 
-def _state_digest_in_child(texts):
+def _state_in_child(texts):
     """Fork; the child imports all of sqlglot from scratch (patched files from `texts`)
     and sends back a digest of the import-time state. None if the child failed."""
-    import hashlib
     import importlib
     import importlib.abc
     import importlib.util
@@ -725,8 +765,11 @@ def _state_digest_in_child(texts):
                         importlib.import_module(m)
                     except Exception as error:
                         failed.append(f"{m}:{type(error).__name__}")
-            digest = hashlib.blake2b(_state_text(failed).encode(), digest_size=16).hexdigest()
-            os.write(w, digest.encode())
+            payload = json.dumps(_state_items(failed), separators=(",", ":")).encode()
+            view = memoryview(payload)
+            while view:
+                n = os.write(w, view)
+                view = view[n:]
             code = 0
         except BaseException:
             code = 3
@@ -735,7 +778,7 @@ def _state_digest_in_child(texts):
     os.close(w)
     data = b""
     while True:
-        chunk = os.read(r, 256)
+        chunk = os.read(r, 1 << 16)
         if not chunk:
             break
         data += chunk
@@ -743,7 +786,7 @@ def _state_digest_in_child(texts):
     _, status = os.waitpid(pid, 0)
     if os.waitstatus_to_exitcode(status) != 0 or not data:
         return None
-    return data.decode()
+    return json.loads(data.decode())
 
 
 def _import_differential(patched, importers):
@@ -777,6 +820,7 @@ class Selector:
             self.by_file.setdefault(t["file"], []).append(t["number"])
             self.by_id[t["id"]] = t["number"]
         self.maps = Maps(len(tests))
+        self.dur = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
         self._test_src = {}
 
     # -- helpers -----------------------------------------------------------
@@ -919,25 +963,89 @@ class Selector:
         self._import_verdict = verdict
         return verdict
 
-    def _import_state_unchanged(self):
-        """Does importing all of sqlglot with this commit's patch leave every
-        import-time value (module/class attributes, defaults, closures) as it was?"""
-        if getattr(self, "_state_verdict", None) is not None:
-            return self._state_verdict
-        verdict = False
+    def _changed_state(self):
+        """Keys of import-time values (module globals, class attributes) whose value
+        differs once the patched package is imported; None when that is unknown."""
+        if getattr(self, "_state_done", False):
+            return self._state_changed
+        changed = None
         patched = {p: t for p, t in getattr(self, "_patched", {}).items()
                    if p.startswith("sqlglot/") and (SRC / p).exists()}
         if patched and hasattr(os, "fork"):
             try:
                 if getattr(Selector, "_pristine_state", None) is None:
-                    Selector._pristine_state = _state_digest_in_child({}) or ""
-                if Selector._pristine_state:
-                    new = _state_digest_in_child(patched)
-                    verdict = new is not None and new == Selector._pristine_state
+                    Selector._pristine_state = _state_in_child({}) or {}
+                base = Selector._pristine_state
+                new = _state_in_child(patched) if base else None
+                if new is not None:
+                    changed = {k for k in set(base) | set(new) if base.get(k) != new.get(k)}
             except Exception:
-                verdict = False
-        self._state_verdict = verdict
-        return verdict
+                changed = None
+        self._state_done = True
+        self._state_changed = changed
+        return changed
+
+    def _import_state_unchanged(self):
+        """Does importing all of sqlglot with this commit's patch leave every
+        import-time value (module/class attributes, defaults, closures) as it was?"""
+        return self._changed_state() == set()
+
+    def _est_cost(self, bits):
+        """Busiest worker + worker fee of the packing `pack` would choose, in ms."""
+        sel = []
+        n = 0
+        while bits:
+            if bits & 1:
+                sel.append(n)
+            bits >>= 1
+            n += 1
+        workers = pack(sel, self.dur)
+        if not workers:
+            return 0
+        return max(sum(self.dur[t] for t in w) for w in workers) + WORKER_COST_MS * len(workers)
+
+    def _name_readers(self, name):
+        """Tests that run a line naming `name` (a changed module-level value), and every
+        test of a test file that names it."""
+        pat = re.compile(r"\b%s\b" % re.escape(name))
+        out = 0
+        for rel, text in self._source_files():
+            if name not in text:
+                continue
+            if rel.startswith("tests/"):
+                out |= self.file_tests(rel)
+                continue
+            for i, line in enumerate(text.split("\n"), 1):
+                if name in line and pat.search(line):
+                    out |= self.maps.line(rel, i)
+        return out
+
+    def _readers_of_changes(self):
+        """Tests that read an import-time value this commit changes, or None when a
+        changed value cannot be mapped to its readers (then the caller widens)."""
+        changed = self._changed_state()
+        if changed is None or "FAILED" in changed:
+            return None
+        base = Selector._pristine_state
+        new_kind = {}
+        out = 0
+        maps = self.maps
+        for key in sorted(changed):
+            old = base.get(key)
+            if old is None:
+                return None  # a new attribute or global: who reads it is unknown
+            if not old.endswith(":d"):
+                return None  # a function, descriptor or class: defaults/closures changed
+            if key.startswith("G|"):
+                out |= self._name_readers(key.rsplit("|", 1)[1])
+                continue
+            readers = maps.attr_readers(key)
+            if readers is None:
+                return None  # no recorder stood in for it
+            out |= readers
+        if changed:
+            out |= maps.attr_readers("__unreliable__") or 0
+        return out
 
     def check_removed_names(self, fp, path, old_text, reg, regions):
         """A class- or module-level name that disappears breaks every module that
@@ -1032,6 +1140,7 @@ class Selector:
         if not is_test:
             self.check_removed_names(fp, path, old_text, reg, regions)
         out = 0
+        wide = 0  # class-user widening, replaced by attribute readers when they are known
         import_time = added_def
         runs_on_import = added_def
         strict_import = added_def  # import-time reasons other than "a function body ran at import"
@@ -1081,13 +1190,13 @@ class Selector:
                 # tests that use the class or a subclass, wherever the reading code is
                 users = maps.class_users(path, name)
                 if users and not is_test:
-                    out |= users
+                    wide |= users
                 else:
                     # never instantiated (enums, mixins, namespaces): widen to the
                     # users of every class in the file, plus the family fallback
                     for rg in regions:
                         if rg[0] == "c":
-                            out |= maps.class_users(path, rg[1])
+                            wide |= maps.class_users(path, rg[1])
                     import_time = True
                     strict_import = True
             elif ln == body - 1 and ln not in removed and ln + 1 in touched:
@@ -1115,7 +1224,27 @@ class Selector:
                     out |= 1 << self.by_id[tid]
         if runs_on_import and not is_test and not self._imports_cleanly():
             raise Unknown("patched module raises when imported")
-        if import_time and not strict_import and not is_test \
+        broad = out | wide
+        if import_time and not is_test and not path.endswith("__init__.py"):
+            for cls_name in classes_hit:
+                broad |= maps.class_users(path, cls_name)
+            broad |= self.family_union(path) | self.import_sensitive()
+        # the state check (a full import of the patched package in a child) costs
+        # about a CPU second: run it only when the broad selection costs clearly more
+        worth_checking = self._est_cost(broad) - self._est_cost(out) > STATE_CHECK_MIN_GAIN_MS
+        if (wide or import_time) and not is_test and not added_def and worth_checking \
+                and not path.endswith("__init__.py") \
+                and not any("lambda" in c for c in _changed_lines(fp)):
+            # import-time state: instead of every user of the class (and the module's
+            # family), the tests that read the values the patch actually changes
+            # (attribute-read map from a recorder pass over the pinned suite; module
+            # globals by the lines that name them). Lambdas are left out: a one-line
+            # lambda's body runs on its definition line, which coverage may not credit.
+            readers = self._readers_of_changes()
+            if readers is not None:
+                return out | readers
+        out |= wide
+        if import_time and not strict_import and not is_test and worth_checking \
                 and not path.endswith("__init__.py") and self._import_state_unchanged():
             # only function bodies that ran during import changed, and importing
             # the patched package leaves every import-time value as it was: what
@@ -1164,7 +1293,8 @@ class Selector:
         out = 0
         self._patched = self._patched_texts(files)
         self._import_verdict = None
-        self._state_verdict = None
+        self._state_done = False
+        self._state_changed = None
         for fp in files:
             if fp.binary:
                 raise Unknown("binary")
