@@ -26,6 +26,8 @@ import zlib
 import os
 import re
 import sys
+import types
+import dis
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -305,11 +307,46 @@ class Maps:
         return self._fix
 
 
+def _code_equal(a, b):
+    """Same bytecode, names and constants, recursively; line numbers are ignored."""
+    for attr in ("co_names", "co_varnames", "co_freevars", "co_cellvars", "co_flags",
+                 "co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_exceptiontable"):
+        if getattr(a, attr, None) != getattr(b, attr, None):
+            return False
+    if a.co_code != b.co_code:
+        # Python 3.13+ class bodies store their own first line number
+        # (`__firstlineno__ = <n>`); a comment above the class shifts only that value
+        if "__firstlineno__" not in a.co_names:
+            return False
+        ia, ib = list(dis.get_instructions(a)), list(dis.get_instructions(b))
+        if len(ia) != len(ib):
+            return False
+        for k, (x, y) in enumerate(zip(ia, ib)):
+            if x.opname != y.opname:
+                return False
+            if x.arg != y.arg:
+                nxt = ia[k + 1] if k + 1 < len(ia) else None
+                if not (nxt and nxt.opname == "STORE_NAME" and nxt.argval == "__firstlineno__"):
+                    return False
+    if len(a.co_consts) != len(b.co_consts):
+        return False
+    for x, y in zip(a.co_consts, b.co_consts):
+        if isinstance(x, types.CodeType) or isinstance(y, types.CodeType):
+            if not (isinstance(x, types.CodeType) and isinstance(y, types.CodeType) and _code_equal(x, y)):
+                return False
+        elif type(x) is not type(y) or repr(x) != repr(y):
+            return False
+    return True
+
+
 def _ast_equal(a, b):
+    """Do the two sources compile to the same program (comments and blank lines aside)?"""
     try:
-        return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
+        ca = compile(a, "<old>", "exec", dont_inherit=True)
+        cb = compile(b, "<new>", "exec", dont_inherit=True)
     except (SyntaxError, ValueError):
         return False
+    return _code_equal(ca, cb)
 
 
 _ENUM_BASES = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "AutoName"}
@@ -343,51 +380,53 @@ def _is_enum_class(name, depth=0):
     return ok
 
 
-def _singleton(node):
-    """None, or a member of an Enum class: `is` and `==` agree on these."""
-    if isinstance(node, ast.Constant) and node.value is None:
+_CMP_SPLIT = re.compile(r"(\bis\s+not\b|\bis\b|==|!=)")
+_SWAPS = {("is", "=="), ("==", "is"), ("is not", "!="), ("!=", "is not")}
+_OPERAND = re.compile(r"[A-Za-z_][\w.]*")
+
+
+def _singleton_text(op):
+    """None, or Cls.MEMBER of an Enum class: `is` and `==` agree on these."""
+    if op == "None":
         return True
-    if isinstance(node, ast.Attribute) and node.attr.isupper():
-        base = node.value
-        cls = base.attr if isinstance(base, ast.Attribute) else base.id if isinstance(base, ast.Name) else None
-        return bool(cls) and _is_enum_class(cls)
-    return False
-
-
-class _IdentityToEquality(ast.NodeTransformer):
-    def visit_Compare(self, node):
-        self.generic_visit(node)
-        if len(node.ops) == 1 and (_singleton(node.left) or _singleton(node.comparators[0])):
-            op = node.ops[0]
-            if isinstance(op, ast.Is):
-                node.ops = [ast.Eq()]
-            elif isinstance(op, ast.IsNot):
-                node.ops = [ast.NotEq()]
-        return node
+    parts = op.split(".")
+    return len(parts) >= 2 and parts[-1].isupper() and _is_enum_class(parts[-2])
 
 
 def _is_eq_rewrite(fp):
-    """Cheap text test: do the removed lines read as the added ones once `is not`/`is`
-    become `!=`/`==`? Only then is the full AST comparison worth its cost."""
-    def norm(lines):
-        return [re.sub(r"\bis\b", "==", c.replace(" is not ", " != ")).strip() for c in lines]
+    """Is every changed line the same as before except for `is`/`is not` <-> `==`/`!=`
+    against None or an Enum member? Decided from the changed lines alone."""
     removed = [hl[1:] for _o, _l, _n, _m, body in fp.hunks for hl in body if hl[:1] == "-"]
     added = list(_added_lines(fp))
-    if not removed or len(removed) != len(added) or not any(" is " in c for c in removed + added):
+    if not removed or len(removed) != len(added):
         return False
-    return norm(removed) == norm(added)
-
-
-def _equivalent(a, b):
-    """Same program up to `is`/`is not` vs `==`/`!=` against None or an Enum member."""
-    try:
-        ta, tb = ast.parse(a), ast.parse(b)
-    except (SyntaxError, ValueError):
-        return False
-    da, db = ast.dump(ta), ast.dump(tb)
-    if da == db:
-        return True
-    return ast.dump(_IdentityToEquality().visit(ta)) == ast.dump(_IdentityToEquality().visit(tb))
+    swapped = False
+    for r, a in zip(removed, added):
+        if r == a:
+            continue
+        if any(q in r or q in a for q in ("'", '"', "#", "\\")):
+            return False  # strings and comments could hide the operators
+        pr, pa = _CMP_SPLIT.split(r), _CMP_SPLIT.split(a)
+        if len(pr) != len(pa):
+            return False
+        for i, (x, y) in enumerate(zip(pr, pa)):
+            if i % 2 == 0:
+                if x.strip() != y.strip():
+                    return False
+                continue
+            x, y = " ".join(x.split()), " ".join(y.split())
+            if x == y:
+                continue
+            if (x, y) not in _SWAPS:
+                return False
+            right = _OPERAND.match(pr[i + 1].lstrip())
+            right_ok = right and _singleton_text(right.group()) and pr[i + 1].lstrip()[right.end():right.end() + 1] not in ("(", "[")
+            left = re.search(r"([A-Za-z_][\w.]*)\s*$", pr[i - 1])
+            left_ok = left and _singleton_text(left.group(1))
+            if not (right_ok or left_ok):
+                return False
+            swapped = True
+    return swapped
 
 
 class Selector:
@@ -584,8 +623,7 @@ class Selector:
             if _ast_equal(old_text, new_text):
                 return 0
         elif _is_eq_rewrite(fp):
-            if _equivalent(old_text, new_text):
-                return 0
+            return 0
         try:
             ast.parse(new_text)
         except (SyntaxError, ValueError):
