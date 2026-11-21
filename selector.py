@@ -312,6 +312,72 @@ def _ast_equal(a, b):
         return False
 
 
+_ENUM_BASES = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "AutoName"}
+_enum_cache = {}
+
+
+def _is_enum_class(name, depth=0):
+    """Is `name` a class defined in sqlglot/ that derives from an Enum (found by source scan)?"""
+    if name in _ENUM_BASES:
+        return True
+    if depth > 3:
+        return False
+    if name in _enum_cache:
+        return _enum_cache[name]
+    _enum_cache[name] = False
+    pat = re.compile(r"^\s*class\s+" + re.escape(name) + r"\s*\(([^)]*)\)", re.M)
+    found = []
+    for f in sorted((SRC / "sqlglot").rglob("*.py")):
+        try:
+            txt = f.read_text()
+        except OSError:
+            continue
+        if ("class " + name) not in txt:
+            continue
+        found += pat.findall(txt)
+    ok = bool(found) and all(
+        any(_is_enum_class(b.strip().split(".")[-1].split("[")[0], depth + 1) for b in bases.split(",") if b.strip())
+        for bases in found
+    )
+    _enum_cache[name] = ok
+    return ok
+
+
+def _singleton(node):
+    """None, or a member of an Enum class: `is` and `==` agree on these."""
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    if isinstance(node, ast.Attribute) and node.attr.isupper():
+        base = node.value
+        cls = base.attr if isinstance(base, ast.Attribute) else base.id if isinstance(base, ast.Name) else None
+        return bool(cls) and _is_enum_class(cls)
+    return False
+
+
+class _IdentityToEquality(ast.NodeTransformer):
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and (_singleton(node.left) or _singleton(node.comparators[0])):
+            op = node.ops[0]
+            if isinstance(op, ast.Is):
+                node.ops = [ast.Eq()]
+            elif isinstance(op, ast.IsNot):
+                node.ops = [ast.NotEq()]
+        return node
+
+
+def _equivalent(a, b):
+    """Same program up to `is`/`is not` vs `==`/`!=` against None or an Enum member."""
+    try:
+        ta, tb = ast.parse(a), ast.parse(b)
+    except (SyntaxError, ValueError):
+        return False
+    da, db = ast.dump(ta), ast.dump(tb)
+    if da == db:
+        return True
+    return ast.dump(_IdentityToEquality().visit(ta)) == ast.dump(_IdentityToEquality().visit(tb))
+
+
 class Selector:
     def __init__(self, tests):
         self.tests = tests
@@ -458,6 +524,9 @@ class Selector:
             raise Unknown("hunks do not apply")
         if all((not c.strip()) or c.strip().startswith("#") for c in _changed_lines(fp)):
             if _ast_equal(old_text, new_text):
+                return 0
+        elif any(" is " in c or "==" in c or "!=" in c for c in _changed_lines(fp)):
+            if _equivalent(old_text, new_text):
                 return 0
         try:
             ast.parse(new_text)
