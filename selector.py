@@ -345,6 +345,71 @@ def _const_equal(x, y):
     return repr(x) == repr(y)
 
 
+def _strip_docstrings(text):
+    """Compiled code of `text` with every module, class and function docstring removed.
+    The scored suite never reads docstrings (tests/test_docs.py is not in it)."""
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                del body[0]
+                if not body and not isinstance(node, ast.Module):
+                    body.append(ast.Pass(lineno=node.lineno, col_offset=0))
+    return compile(tree, "<doc>", "exec", dont_inherit=True)
+
+
+def _in_triple_quotes(fp, old_text, new_text):
+    """Cheap filter: does every changed line sit inside (or open/close) a triple-quoted string?"""
+    old_lines, new_lines = old_text.splitlines(), new_text.splitlines()
+    parity = {}
+
+    def open_before(lines):
+        # open_before[i]: is a triple-quoted string still open at the start of line i?
+        key = id(lines)
+        if key not in parity:
+            out, d, s = [], 0, 0
+            for line in lines:
+                out.append(d % 2 == 1 or s % 2 == 1)
+                d += line.count('"""')
+                s += line.count("'''")
+            parity[key] = out
+        return parity[key]
+
+    def inside(lines, idx):
+        if not 0 <= idx < len(lines):
+            return False
+        line = lines[idx]
+        return '"""' in line or "'''" in line or open_before(lines)[idx]
+
+    for os_, _ol, ns, _nl, body in fp.hunks:
+        o, n = os_ - 1, ns - 1
+        for hl in body:
+            tag = hl[:1]
+            if tag == "-":
+                if hl[1:].strip() and not inside(old_lines, o):
+                    return False
+                o += 1
+            elif tag == "+":
+                if hl[1:].strip() and not inside(new_lines, n):
+                    return False
+                n += 1
+            else:
+                o += 1
+                n += 1
+    return True
+
+
+def _docstring_only(fp, old_text, new_text):
+    if not _in_triple_quotes(fp, old_text, new_text):
+        return False
+    try:
+        return _code_equal(_strip_docstrings(old_text), _strip_docstrings(new_text))
+    except (SyntaxError, ValueError):
+        return False
+
+
 def _ast_equal(a, b):
     """Do the two sources compile to the same program (comments and blank lines aside)?"""
     try:
@@ -629,6 +694,8 @@ class Selector:
             if _ast_equal(old_text, new_text):
                 return 0
         elif _is_eq_rewrite(fp):
+            return 0
+        if _docstring_only(fp, old_text, new_text):
             return 0
         try:
             ast.parse(new_text)
