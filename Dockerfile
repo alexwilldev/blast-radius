@@ -12,6 +12,10 @@ ms=[m for m in t.getmembers() if m.name.split('/')[1:2] in (['sqlglot'],['tests'
 t.extractall('/app/src', members=ms, filter='data')" \
  && test -f /app/src/sqlglot/parser.py && chmod -R a+rX /app
 
+# Bytecode for the pinned source, so the import check (selector.py) does not
+# recompile sqlglot on every run in the read-only container.
+RUN python -m compileall -q /app/src/sqlglot && chmod -R a+rX /app/src
+
 # Structure maps (def/class/statement spans, import graph) from the pinned source.
 COPY build_struct.py /app/build_struct.py
 RUN python /app/build_struct.py /app/src /app/struct
