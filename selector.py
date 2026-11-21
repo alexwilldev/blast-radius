@@ -328,15 +328,21 @@ def _code_equal(a, b):
                 nxt = ia[k + 1] if k + 1 < len(ia) else None
                 if not (nxt and nxt.opname == "STORE_NAME" and nxt.argval == "__firstlineno__"):
                     return False
-    if len(a.co_consts) != len(b.co_consts):
+    return _const_equal(a.co_consts, b.co_consts)
+
+
+def _const_equal(x, y):
+    """Compare compiled constants by value. Not by repr: a frozenset's repr order
+    follows the per-process string hash seed, so equal sets can print differently."""
+    if type(x) is not type(y):
         return False
-    for x, y in zip(a.co_consts, b.co_consts):
-        if isinstance(x, types.CodeType) or isinstance(y, types.CodeType):
-            if not (isinstance(x, types.CodeType) and isinstance(y, types.CodeType) and _code_equal(x, y)):
-                return False
-        elif type(x) is not type(y) or repr(x) != repr(y):
-            return False
-    return True
+    if isinstance(x, types.CodeType):
+        return _code_equal(x, y)
+    if isinstance(x, tuple):
+        return len(x) == len(y) and all(_const_equal(p, q) for p, q in zip(x, y))
+    if isinstance(x, frozenset):
+        return x == y and sorted(map(repr, x)) == sorted(map(repr, y))
+    return repr(x) == repr(y)
 
 
 def _ast_equal(a, b):
