@@ -475,6 +475,38 @@ class Selector:
                         pass
         return self._sources
 
+    def _source_paths(self):
+        if not hasattr(self, "_source_set"):
+            self._source_set = {rel for rel, _ in self._source_files()}
+        return self._source_set
+
+    def _defined_elsewhere(self, name, path):
+        """Is `name` bound as a class attribute in some other sqlglot class (a base to fall back to)?"""
+        pat = re.compile(r"^[ \t]+%s\s*(?::[^=\n]*)?=" % re.escape(name), re.M)
+        for rel, text in self._source_files():
+            if rel != path and rel.startswith("sqlglot/") and pat.search(text):
+                return True
+        return False
+
+    def _patched_texts(self, files):
+        """New text of every .py file the patch modifies or adds (None if unknown)."""
+        out = {}
+        for fp in files:
+            path = fp.path or ""
+            if not path.endswith(".py") or fp.binary:
+                continue
+            if fp.old is None and fp.new:
+                out[fp.new] = "\n".join(_added_lines(fp))
+            elif fp.old and fp.new and fp.old == fp.new:
+                try:
+                    old_text = (SRC / fp.old).read_text()
+                except OSError:
+                    continue
+                new_text = apply_hunks(old_text, fp.hunks)
+                if new_text is not None:
+                    out[fp.old] = new_text
+        return out
+
     def check_removed_names(self, fp, path, old_text, reg, regions):
         """A class- or module-level name that disappears breaks every module that
         refers to it (an enum member, a constant, an imported helper)."""
@@ -497,18 +529,32 @@ class Selector:
                             removed.append((name, r))
                 if hl[:1] in " -":
                     o += 1
+        class_names = {rg[1] for rg in regions if rg[0] == "c"}
         for name, r in removed:
-            in_class = r >= 0 and regions[r][0] == "c"
-            if in_class and not (name.isupper() and len(name) > 1):
-                continue  # an inherited attribute or method falls back to the base class
+            owner = None  # qualname of the class the removed name belongs to
+            if r >= 0:
+                if regions[r][0] == "c":
+                    owner = regions[r][1]
+                elif "." in regions[r][1] and regions[r][1].rsplit(".", 1)[0] in class_names:
+                    owner = regions[r][1].rsplit(".", 1)[0]  # a method
+            if owner:
+                if not (name.isupper() and len(name) > 1):
+                    continue  # an inherited attribute or method falls back to the base class
+                if not _is_enum_class(owner.rsplit(".", 1)[-1]) and self._defined_elsewhere(name, path):
+                    continue  # an overridden class setting falls back to the base value
             pat = re.compile(r"\b%s\b" % re.escape(name))
+            # search the tree as it is after the whole patch: a commit that removes
+            # a helper together with its callers leaves nothing that refers to it
+            patched = getattr(self, "_patched", {})
             for rel, text in self._source_files():
-                if rel == path:
-                    hits = len(pat.findall(text))
-                    if hits > len(pat.findall("\n".join(c for c in _changed_lines(fp)))):
+                text = patched.get(rel, text)
+                if pat.search(text):
+                    if rel == path:
                         raise Unknown(f"removed name {name} still used in its module")
-                elif pat.search(text):
                     raise Unknown(f"removed name {name} used in {rel}")
+            for rel, text in patched.items():
+                if rel not in self._source_paths() and pat.search(text):
+                    raise Unknown(f"removed name {name} used in new file {rel}")
 
     # -- per file kinds ----------------------------------------------------
 
@@ -665,6 +711,7 @@ class Selector:
         if not files:
             raise Unknown("empty patch")
         out = 0
+        self._patched = self._patched_texts(files)
         for fp in files:
             if fp.binary:
                 raise Unknown("binary")
