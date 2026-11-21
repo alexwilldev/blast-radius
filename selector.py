@@ -36,6 +36,7 @@ APP = Path(os.environ.get("BR_APP", Path(__file__).resolve().parent))
 STRUCT = Path(os.environ.get("BR_STRUCT", APP / "struct"))
 MAPS = APP / "maps"
 MAX_WORKERS = 8
+IMPORT_CHECK_FANOUT = 8  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
 
 
@@ -500,6 +501,88 @@ def _is_eq_rewrite(fp):
     return swapped
 
 
+def _modname(path):
+    parts = list(Path(path).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _run_module(path, text):
+    """Execute `text` as module `path`, replacing it in sys.modules (child process only)."""
+    import types as _t
+    name = _modname(path)
+    mod = _t.ModuleType(name)
+    mod.__file__ = str(SRC / path)
+    if path.endswith("__init__.py"):
+        mod.__path__ = [str((SRC / path).parent)]
+        mod.__package__ = name
+    else:
+        mod.__package__ = name.rpartition(".")[0]
+    sys.modules[name] = mod
+    exec(compile(text, str(SRC / path), "exec", dont_inherit=True), mod.__dict__)
+    pkg, _, leaf = name.rpartition(".")
+    if pkg in sys.modules:
+        setattr(sys.modules[pkg], leaf, mod)
+
+
+def _load_pristine(paths):
+    """Import the pristine modules (and so their dependencies) into this process, once."""
+    import importlib
+    import io
+    import contextlib
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    sys.dont_write_bytecode = True
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        for p in paths:
+            importlib.import_module(_modname(p))
+
+
+def _child_runs(order, texts):
+    """Fork; in the child run every module in `order` with texts[path] (or its pristine text)."""
+    import signal
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 3
+        try:
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            signal.alarm(10)
+            for p in order:
+                _run_module(p, texts.get(p) if p in texts else (SRC / p).read_text())
+            code = 0
+        except BaseException:
+            code = 3
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) == 0
+
+
+def _import_differential(patched, importers):
+    """False only when the patched modules raise and the same run with pristine text does not."""
+    paths = sorted(patched)
+    _load_pristine(paths)
+    order = list(paths)
+    for p in paths:
+        imps = [i for i in importers.get(p, ()) if i.startswith("sqlglot/") and _modname(i) in sys.modules]
+        if len(imps) > IMPORT_CHECK_FANOUT:
+            # a core module: re-running dozens of importers is slow and full of
+            # re-execution artefacts; edits to its class bodies already reach
+            # nearly every test through the class-users map
+            continue
+        for imp in imps:
+            if imp not in order:
+                order.append(imp)
+    if _child_runs(order, patched):
+        return True
+    return not _child_runs(order, {})
+
+
 class Selector:
     def __init__(self, tests):
         self.tests = tests
@@ -629,6 +712,30 @@ class Selector:
                     out[fp.old] = new_text
         return out
 
+    # -- import check ------------------------------------------------------
+    # Code that raises while a module is imported (a class body popping a missing
+    # key, a bad constant) fails every test that loads the module, which coverage
+    # cannot see. Run the patched modules (and the sqlglot modules that import them)
+    # in a forked child on top of the pristine package, and run the same modules with
+    # their pristine text in another child: only "pristine runs, patched raises"
+    # counts, so artefacts of re-running a module do not.
+
+    _pkg_loaded = None
+
+    def _imports_cleanly(self):
+        if getattr(self, "_import_verdict", None) is not None:
+            return self._import_verdict
+        patched = {p: t for p, t in getattr(self, "_patched", {}).items()
+                   if p.startswith("sqlglot/") and (SRC / p).exists()}
+        verdict = True
+        if patched and hasattr(os, "fork"):
+            try:
+                verdict = _import_differential(patched, self.maps.imports)
+            except Exception:
+                verdict = True  # the check itself broke: no signal either way
+        self._import_verdict = verdict
+        return verdict
+
     def check_removed_names(self, fp, path, old_text, reg, regions):
         """A class- or module-level name that disappears breaks every module that
         refers to it (an enum member, a constant, an imported helper)."""
@@ -723,6 +830,7 @@ class Selector:
             self.check_removed_names(fp, path, old_text, reg, regions)
         out = 0
         import_time = added_def
+        runs_on_import = added_def
         at_import = set(maps.import_lines(path))
         class_names = {rg[1] for rg in regions if rg[0] == "c"}
         classes_hit = set()
@@ -751,13 +859,18 @@ class Selector:
             ran_at_import = any(x in at_import and x not in header
                                 for x in range(s if s and s < ln else ln, ln + 1))
             r = reg[ln - 1]
+            if ran_at_import:
+                runs_on_import = True
             if r < 0:  # module level
                 import_time = True
+                runs_on_import = True
                 continue
             cls_name = enclosing_class(r)
             if cls_name:
                 classes_hit.add(cls_name)
             kind, name, start, end, body = regions[r]
+            if kind == "c" or ln < body:
+                runs_on_import = True  # class body, decorator or signature
             if kind == "c":
                 # class-body state (arg_types, dialect settings, tables) reaches the
                 # tests that use the class or a subclass, wherever the reading code is
@@ -793,6 +906,8 @@ class Selector:
                     tid = f"{path}::{name}"
                 if tid in self.by_id:
                     out |= 1 << self.by_id[tid]
+        if runs_on_import and not is_test and not self._imports_cleanly():
+            raise Unknown("patched module raises when imported")
         if import_time:
             # class-level state (arg_types, dialect settings, tables) reaches every
             # test that uses the class or a subclass, wherever the reading code lives
@@ -835,6 +950,7 @@ class Selector:
             raise Unknown("empty patch")
         out = 0
         self._patched = self._patched_texts(files)
+        self._import_verdict = None
         for fp in files:
             if fp.binary:
                 raise Unknown("binary")
