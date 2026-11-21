@@ -392,6 +392,54 @@ class Selector:
             out |= self.maps.file_union(m)
         return out
 
+    BINDING_RE = re.compile(r"^\s*(?:(?:async\s+)?def\s+(\w+)|class\s+(\w+)|(\w+)\s*(?::[^=]*)?=(?!=))")
+
+    def _source_files(self):
+        if not hasattr(self, "_sources"):
+            self._sources = []
+            for top in ("sqlglot", "tests"):
+                for p in sorted((SRC / top).rglob("*.py")):
+                    try:
+                        self._sources.append((str(p.relative_to(SRC)), p.read_text()))
+                    except OSError:
+                        pass
+        return self._sources
+
+    def check_removed_names(self, fp, path, old_text, reg, regions):
+        """A class- or module-level name that disappears breaks every module that
+        refers to it (an enum member, a constant, an imported helper)."""
+        added = set()
+        for c in _added_lines(fp):
+            m = self.BINDING_RE.match(c)
+            if m:
+                added.add(next(g for g in m.groups() if g))
+        removed = []
+        for os_, ol, _ns, _nl, body in fp.hunks:
+            o = os_
+            for hl in body:
+                if hl[:1] == "-":
+                    m = self.BINDING_RE.match(hl[1:])
+                    r = reg[o - 1] if 0 < o <= len(reg) else -1
+                    at_top = r < 0 or regions[r][0] == "c" or regions[r][2] == o
+                    if m and at_top:
+                        name = next(g for g in m.groups() if g)
+                        if name not in added and not name.startswith("__"):
+                            removed.append((name, r))
+                if hl[:1] in " -":
+                    o += 1
+        for name, r in removed:
+            in_class = r >= 0 and regions[r][0] == "c"
+            if in_class and not (name.isupper() and len(name) > 1):
+                continue  # an inherited attribute or method falls back to the base class
+            pat = re.compile(r"\b%s\b" % re.escape(name))
+            for rel, text in self._source_files():
+                if rel == path:
+                    hits = len(pat.findall(text))
+                    if hits > len(pat.findall("\n".join(c for c in _changed_lines(fp)))):
+                        raise Unknown(f"removed name {name} still used in its module")
+                elif pat.search(text):
+                    raise Unknown(f"removed name {name} used in {rel}")
+
     # -- per file kinds ----------------------------------------------------
 
     def python_file(self, fp, is_test):
@@ -424,6 +472,8 @@ class Selector:
         reg, stmt, regions = st["reg"], st["stmt"], st["regions"]
         touched = old_lines_touched(fp, n)
         added_def = any(c.lstrip().startswith(("def ", "async def ", "class ", "@")) for c in _added_lines(fp))
+        if not is_test:
+            self.check_removed_names(fp, path, old_text, reg, regions)
         out = 0
         import_time = added_def
         at_import = set(maps.import_lines(path))
@@ -463,6 +513,11 @@ class Selector:
                 if users and not is_test:
                     out |= users
                 else:
+                    # never instantiated (enums, mixins, namespaces): widen to the
+                    # users of every class in the file, plus the family fallback
+                    for rg in regions:
+                        if rg[0] == "c":
+                            out |= maps.class_users(path, rg[1])
                     import_time = True
             elif ln < body:  # decorator or signature: affects every call
                 out |= maps.lines(path, body, end)
