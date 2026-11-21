@@ -8,6 +8,7 @@ Method (all maps are built from sqlglot at the pinned commit, never from patches
   tests/, with the suite's process pools run in-process so their work is
   attributed to the test that submitted it.
 - maps/fixtures.json: which tests open which fixture file.
+- maps/import_lines.z: lines executed just by importing every module.
 - /app/struct (built in the Dockerfile): def/class/statement spans per file and
   the static import graph.
 A changed line selects the tests that execute it or its enclosing statement.
@@ -223,6 +224,7 @@ class Maps:
         self._imports = None
         self._file_union = {}
         self._set_cache = {}
+        self._import_lines = None
 
     @property
     def idx(self):
@@ -265,6 +267,12 @@ class Maps:
             p = STRUCT / (path + ".json")
             self._struct[path] = json.loads(p.read_text()) if p.exists() else None
         return self._struct[path]
+
+    def import_lines(self, path):
+        """Lines executed just by importing every module (no test running)."""
+        if self._import_lines is None:
+            self._import_lines = json.loads(zlib.decompress((MAPS / "import_lines.z").read_bytes()))
+        return self._import_lines.get(path, ())
 
     @property
     def imports(self):
@@ -404,6 +412,7 @@ class Selector:
         added_def = any(c.lstrip().startswith(("def ", "async def ", "class ", "@")) for c in _added_lines(fp))
         out = 0
         import_time = added_def
+        at_import = set(maps.import_lines(path))
         for ln in touched:
             out |= maps.line(path, ln)
             s = stmt[ln - 1]
@@ -411,6 +420,10 @@ class Selector:
                 # a multi-line statement: every line from its start up to the change
                 # (e.g. an `and` turned `or` in a later line of an `if (...)` header)
                 out |= maps.lines(path, s, ln)
+            if any(x in at_import for x in range(s if s and s < ln else ln, ln + 1)):
+                # runs while modules are imported (helpers building dialect tables,
+                # metaclasses, templates): its effect outlives any single test
+                import_time = True
             r = reg[ln - 1]
             if r < 0:
                 import_time = True
