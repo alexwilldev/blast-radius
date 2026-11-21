@@ -5,7 +5,7 @@
 Everything is derived from sqlglot at the pinned commit `eb11aec`. No table maps patches, or kinds of edit, to tests.
 
 - `maps/coverage.idx` + `maps/coverage.sets`: per-test line coverage of `sqlglot/` and `tests/` (pytest-cov `--cov-context=test`). The suite's `ProcessPoolExecutor`s were run in-process during the coverage run, with pickling kept, so work done in pool workers counts toward the test that submitted it. Identical test sets are stored once as bitsets.
-- `maps/fixtures.json`: which tests open which fixture files (recorded with an `open` audit hook).
+- `maps/fixtures.json`: which tests open which fixture files (recorded with an `open` audit hook). A file read during a test's setup phase (`setUpClass`) counts for every test in that class.
 - `maps/import_lines.z`: lines executed just by importing every module and creating each dialect's tokenizer, parser and generator once. These run once per process (dialect tables, dispatch caches), so coverage can't credit them to the tests that depend on them.
 - `maps/usage.idx` + `maps/usage.sets`: which tests instantiate each sqlglot class (or look it up as a dialect), counting every sqlglot class in its MRO. Built in a separate instrumented run of the suite.
 - `build_struct.py` (runs in the Dockerfile): def/class/statement spans and the static import graph of the pinned source.
