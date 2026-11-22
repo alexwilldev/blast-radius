@@ -38,7 +38,10 @@ MAPS = APP / "maps"
 MAX_WORKERS = 8
 IMPORT_CHECK_FANOUT = 8
 STATE_CHECK_MIN_GAIN_MS = 3000
-ZYGOTE_MAX_MODULES = 40  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
+ZYGOTE_MAX_MODULES = 40
+CHECK_RUN_MAX_TESTS = 60       # run a selection on the patched sources only if it is this small
+CHECK_RUN_OVERHEAD_MS = 900    # fresh sqlglot import + test modules in the check-run child
+CHECK_RUN_MIN_GAIN_MS = 500    # and only when the expected saving beats its CPU by this much  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
 
 
@@ -855,6 +858,76 @@ def _state_in_child(texts, only=None):
     return json.loads(data.decode())
 
 
+def _check_run(texts, test_ids, budget_s):
+    """Fork; run the given tests (unittest, as in the scored suite) on the patched
+    sources served from memory. True only if every test passes: any failure, error,
+    skip, import problem, timeout or crash counts as 'not proven'."""
+    import importlib
+    import importlib.abc
+    import importlib.util
+    import signal
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 3
+        try:
+            # imported only here: sqlglot records at import whether unittest is loaded
+            # (expressions.core.UNITTEST), so the parent must never import it
+            import unittest
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            signal.alarm(max(1, int(budget_s)))
+            os.environ["SKIP_INTEGRATION"] = "0"
+            for n in [n for n in sys.modules if n.split(".")[0] in ("sqlglot", "tests")]:
+                del sys.modules[n]
+            if str(SRC) not in sys.path:
+                sys.path.insert(0, str(SRC))
+            sys.dont_write_bytecode = True
+            os.chdir(str(SRC))
+            by_name = {}
+
+            class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+                def find_spec(self, name, path, target=None):
+                    rel = name.replace(".", "/")
+                    for cand in (rel + ".py", rel + "/__init__.py"):
+                        if cand in texts:
+                            by_name[name] = cand
+                            sub = [str(SRC / rel)] if cand.endswith("__init__.py") else None
+                            return importlib.util.spec_from_file_location(
+                                name, str(SRC / cand), loader=self, submodule_search_locations=sub)
+                    return None
+
+                def create_module(self, spec):
+                    return None
+
+                def exec_module(self, module):
+                    rel = by_name[module.__name__]
+                    exec(compile(texts[rel], module.__spec__.origin, "exec", dont_inherit=True), module.__dict__)
+
+            sys.meta_path.insert(0, Finder())
+            suite = unittest.TestSuite()
+            for tid in test_ids:
+                parts = tid.split("::")
+                mod = importlib.import_module(parts[0][:-3].replace("/", "."))
+                obj = mod
+                for part in parts[1:-1]:
+                    obj = getattr(obj, part)
+                suite.addTest(obj(parts[-1]))
+            result = unittest.TestResult()
+            suite.run(result)
+            ok = (result.testsRun == len(test_ids) and not result.failures and not result.errors
+                  and not result.skipped and not result.unexpectedSuccesses)
+            code = 0 if ok else 1
+        except BaseException:
+            code = 3
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) == 0
+
+
 def _import_differential(patched, importers):
     """False only when the patched modules raise and the same run with pristine text does not."""
     paths = sorted(patched)
@@ -1074,6 +1147,30 @@ class Selector:
         """Does importing all of sqlglot with this commit's patch leave every
         import-time value (module/class attributes, defaults, closures) as it was?"""
         return self._changed_state() == set()
+
+    def _check_run_pays(self, bits):
+        """For a small, cheap selection: run it on the patched sources; if every test
+        passes, nothing this commit selects can fail, so nothing needs to run."""
+        files = getattr(self, "_files", None) or []
+        if not files or any(fp.binary or fp.old is None or fp.new is None or fp.old != fp.new
+                            or not (fp.path or "").endswith(".py")
+                            or not (fp.path or "").startswith(("sqlglot/", "tests/"))
+                            for fp in files):
+            return False  # only edits to existing modules: the copy in memory is complete
+        if not hasattr(os, "fork") or len(self._patched) != len(files):
+            return False
+        sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
+        if len(sel) > CHECK_RUN_MAX_TESTS:
+            return False
+        run_ms = sum(self.dur[n] for n in sel)
+        if self._est_cost(bits) - (CHECK_RUN_OVERHEAD_MS + 1.5 * run_ms) < CHECK_RUN_MIN_GAIN_MS:
+            return False
+        id_of = {t["number"]: t["id"] for t in self.tests}
+        ids = [id_of[n] for n in sel]
+        try:
+            return _check_run(self._patched, ids, budget_s=5 + 3 * run_ms / 1000)
+        except Exception:
+            return False
 
     def _est_cost(self, bits):
         """Busiest worker + worker fee of the packing `pack` would choose, in ms."""
@@ -1398,6 +1495,7 @@ class Selector:
             raise Unknown("empty patch")
         out = 0
         self._patched = self._patched_texts(files)
+        self._files = files
         self._import_verdict = None
         self._state_done = False
         self._state_changed = None
@@ -1430,6 +1528,9 @@ class Selector:
         except Unknown as why:
             log(f"  unknown ({why}): all tests")
             bits = self.all_bits
+        else:
+            if bits and self._check_run_pays(bits):
+                bits = 0
         out = []
         n = 0
         while bits:
