@@ -1290,6 +1290,15 @@ class Selector:
         except Exception:
             return False
 
+    def _spawns_workers(self, test_id):
+        """Does the test's file start other Python processes (spawn process pools,
+        subprocess)? Those import sqlglot from disk, i.e. the pinned sources, not the
+        patched copy the check run holds in memory, so a pass there proves nothing."""
+        f = test_id.split("::", 1)[0]
+        text = self._test_file_text(f) or ""
+        return any(w in text for w in ("ProcessPoolExecutor", "multiprocessing", "get_context(",
+                                       "subprocess", "os.system", "Popen", "os.fork"))
+
     def _check_longest(self, bits):
         """The longest selected test often sets the busiest worker on its own (for
         example test_generator_memory: 6.7 s recorded, under 2 s to run). When dropping
@@ -1301,7 +1310,7 @@ class Selector:
         sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
         longest = max(sel, key=lambda n: self.dur[n])
         tid = id_of[longest]
-        if tid not in RUN_COST_S:
+        if tid not in RUN_COST_S or self._spawns_workers(tid):
             return bits
         gain = self._est_cost(bits) - self._est_cost(bits & ~(1 << longest))
         if gain - (CHECK_RUN_OVERHEAD_MS + 1500 * RUN_COST_S[tid]) < LONG_CHECK_MIN_GAIN_MS:
@@ -1326,6 +1335,8 @@ class Selector:
             return False
         id_of = {t["number"]: t["id"] for t in self.tests}
         ids = [id_of[n] for n in sel]
+        if any(self._spawns_workers(i) for i in ids):
+            return False
         try:
             return _check_run(self._patched, ids, budget_s=5 + 3 * run_ms / 1000)
         except Exception:
