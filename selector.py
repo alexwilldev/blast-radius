@@ -41,6 +41,19 @@ STATE_CHECK_MIN_GAIN_MS = 3000
 ZYGOTE_MAX_MODULES = 40
 MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"  # 28.8 s in the pinned suite
 MAX_NODES_MIN_GAIN_MS = 4000
+LONG_CHECK_MIN_GAIN_MS = 1000  # check-run one long test when the saving beats its cost by this
+RUN_COST_S = {  # CPU to run these tests alone, measured once at the pinned commit
+    'tests/test_executor.py::TestExecutor::test_agg_order': 1.494,
+    'tests/test_generator.py::TestGenerator::test_generator_memory': 1.794,
+    'tests/test_optimizer.py::TestOptimizer::test_annotate_funcs': 0.833,
+    'tests/test_optimizer.py::TestOptimizer::test_canonicalize': 0.057,
+    'tests/test_optimizer.py::TestOptimizer::test_merge_subqueries': 0.517,
+    'tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls': 0.816,
+    'tests/test_optimizer.py::TestOptimizer::test_qualify_columns': 0.807,
+    'tests/test_optimizer.py::TestOptimizer::test_scope': 1.306,
+    'tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries': 0.294,
+}
+
 CHECK_RUN_MAX_TESTS = 60       # run a selection on the patched sources only if it is this small
 CHECK_RUN_OVERHEAD_MS = 900    # fresh sqlglot import + test modules in the check-run child
 CHECK_RUN_MIN_GAIN_MS = 500    # and only when the expected saving beats its CPU by this much  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
@@ -1216,6 +1229,29 @@ class Selector:
         except Exception:
             return False
 
+    def _check_longest(self, bits):
+        """The longest selected test often sets the busiest worker on its own (for
+        example test_generator_memory: 6.7 s recorded, under 2 s to run). When dropping
+        it would save more than running it costs, run that one test on the patched
+        sources and drop it if it passes."""
+        if not self._only_py_edits():
+            return bits
+        id_of = {t["number"]: t["id"] for t in self.tests}
+        sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
+        longest = max(sel, key=lambda n: self.dur[n])
+        tid = id_of[longest]
+        if tid not in RUN_COST_S:
+            return bits
+        gain = self._est_cost(bits) - self._est_cost(bits & ~(1 << longest))
+        if gain - (CHECK_RUN_OVERHEAD_MS + 1500 * RUN_COST_S[tid]) < LONG_CHECK_MIN_GAIN_MS:
+            return bits
+        try:
+            if _check_run(self._patched, [tid], budget_s=10 + 3 * RUN_COST_S[tid]):
+                return bits & ~(1 << longest)
+        except Exception:
+            pass
+        return bits
+
     def _check_run_pays(self, bits):
         """For a small, cheap selection: run it on the patched sources; if every test
         passes, nothing this commit selects can fail, so nothing needs to run."""
@@ -1596,6 +1632,8 @@ class Selector:
                 bits &= ~(1 << mx)
             if bits and self._check_run_pays(bits):
                 bits = 0
+            elif bits:
+                bits = self._check_longest(bits)
         out = []
         n = 0
         while bits:
