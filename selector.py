@@ -1371,6 +1371,7 @@ class Selector:
                 if hl[:1] in " -":
                     o += 1
         class_names = {rg[1] for rg in regions if rg[0] == "c"}
+        used = []
         for name, r in removed:
             owner = None  # qualname of the class the removed name belongs to
             if r >= 0:
@@ -1386,16 +1387,31 @@ class Selector:
             pat = re.compile(r"\b%s\b" % re.escape(name))
             # search the tree as it is after the whole patch: a commit that removes
             # a helper together with its callers leaves nothing that refers to it
-            patched = getattr(self, "_patched", {})
+            patched = getattr(self, "_patched", {}) or {}
             for rel, text in self._source_files():
-                text = patched.get(rel, text)
-                if pat.search(text):
-                    if rel == path:
-                        raise Unknown(f"removed name {name} still used in its module")
-                    raise Unknown(f"removed name {name} used in {rel}")
+                new_text = patched.get(rel, text)
+                if pat.search(new_text):
+                    if rel in patched and not pat.search(text):
+                        raise Unknown(f"removed name {name} newly used in {rel}")
+                    used.append(name)
+                    break
             for rel, text in patched.items():
                 if rel not in self._source_paths() and pat.search(text):
                     raise Unknown(f"removed name {name} used in new file {rel}")
+        if not used:
+            return 0
+        # Still referenced. If the patched package imports without any new failure, the
+        # name breaks only the code that runs a line naming it: those lines' tests.
+        changed = self._changed_state()
+        if changed is None or "FAILED" in changed:
+            raise Unknown(f"removed name {used[0]} still used")
+        out = 0
+        for name in used:
+            if any(name in line and "lambda" in line
+                   for _rel, text in self._source_files() for line in text.split("\n")):
+                raise Unknown(f"removed name {name} used in a lambda")
+            out |= self._name_readers(name)
+        return out
 
     # -- per file kinds ----------------------------------------------------
 
@@ -1438,9 +1454,10 @@ class Selector:
         for rg in regions:
             header.update(range(rg[2], rg[4]))
         added_def = any(c.lstrip().startswith(("def ", "async def ", "class ", "@")) for c in _added_lines(fp))
+        removed_users = 0
         if not is_test:
-            self.check_removed_names(fp, path, old_text, reg, regions)
-        out = 0
+            removed_users = self.check_removed_names(fp, path, old_text, reg, regions)
+        out = removed_users
         wide = 0  # class-user widening, replaced by attribute readers when they are known
         import_time = added_def
         runs_on_import = added_def
