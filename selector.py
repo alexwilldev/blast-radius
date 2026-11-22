@@ -39,6 +39,8 @@ MAX_WORKERS = 8
 IMPORT_CHECK_FANOUT = 8
 STATE_CHECK_MIN_GAIN_MS = 3000
 ZYGOTE_MAX_MODULES = 40
+MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"  # 28.8 s in the pinned suite
+MAX_NODES_MIN_GAIN_MS = 4000
 CHECK_RUN_MAX_TESTS = 60       # run a selection on the patched sources only if it is this small
 CHECK_RUN_OVERHEAD_MS = 900    # fresh sqlglot import + test modules in the check-run child
 CHECK_RUN_MIN_GAIN_MS = 500    # and only when the expected saving beats its CPU by this much  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
@@ -858,7 +860,33 @@ def _state_in_child(texts, only=None):
     return json.loads(data.decode())
 
 
-def _check_run(texts, test_ids, budget_s):
+def _max_nodes_standin():
+    """tests/test_parser.py::TestParser::test_max_nodes at 1/25 scale: the same
+    statements and assertions with the width and both node limits divided by 25."""
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+    assert isinstance(parse_one("SELECT 1", max_nodes=40_000), exp.Select)
+    cols = [f"col{i}" for i in range(500)]
+    assert isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=40_000), exp.Select)
+    expr = "x" + "=x" * 100
+    sql = "SELECT " + ",".join(expr for _ in range(400))
+    for limit, text in ((40_000, "Maximum number of AST nodes"), (2_000, "(2000)")):
+        try:
+            parse_one(sql, max_nodes=limit)
+        except ParseError as error:
+            assert text in str(error)
+        else:
+            raise AssertionError("no ParseError")
+    try:
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+    except ParseError:
+        pass
+    else:
+        raise AssertionError("no ParseError")
+    assert isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+
+
+def _check_run(texts, test_ids, budget_s, standin=False):
     """Fork; run the given tests (unittest, as in the scored suite) on the patched
     sources served from memory. True only if every test passes: any failure, error,
     skip, import problem, timeout or crash counts as 'not proven'."""
@@ -907,6 +935,9 @@ def _check_run(texts, test_ids, budget_s):
                     exec(compile(texts[rel], module.__spec__.origin, "exec", dont_inherit=True), module.__dict__)
 
             sys.meta_path.insert(0, Finder())
+            if standin:
+                _max_nodes_standin()
+                os._exit(0)
             suite = unittest.TestSuite()
             for tid in test_ids:
                 parts = tid.split("::")
@@ -1148,17 +1179,48 @@ class Selector:
         import-time value (module/class attributes, defaults, closures) as it was?"""
         return self._changed_state() == set()
 
+    def _only_py_edits(self):
+        files = getattr(self, "_files", None) or []
+        return bool(files) and hasattr(os, "fork") and len(self._patched) == len(files) and not any(
+            fp.binary or fp.old is None or fp.new is None or fp.old != fp.new
+            or not (fp.path or "").endswith(".py") or not (fp.path or "").startswith(("sqlglot/", "tests/"))
+            for fp in files)
+
+    def _max_nodes_drops(self, bits, mx):
+        """test_max_nodes (28.8 s) is selected by most parser edits and almost never
+        fails. Run a 1/25-scale stand-in on the patched sources; drop the test when it
+        passes and is not much slower than the same stand-in on the pinned sources
+        (an edit that slows parsing would time the real test out)."""
+        if not self._only_py_edits():
+            return False
+        if self._est_cost(bits) - self._est_cost(bits & ~(1 << mx)) < MAX_NODES_MIN_GAIN_MS:
+            return False
+        if any(p.startswith("tests/test_parser") for p in self._patched):
+            return False  # the test itself changed
+        try:
+            import resource
+
+            def timed(texts):
+                r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                ok = _check_run(texts, [], budget_s=20, standin=True)
+                r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                return ok, (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime)
+
+            if getattr(Selector, "_standin_base", None) is None:
+                ok, t = timed({})
+                Selector._standin_base = t if ok else 0
+            if not Selector._standin_base:
+                return False
+            ok, t = timed(self._patched)
+            return ok and t <= 1.5 * Selector._standin_base + 0.3
+        except Exception:
+            return False
+
     def _check_run_pays(self, bits):
         """For a small, cheap selection: run it on the patched sources; if every test
         passes, nothing this commit selects can fail, so nothing needs to run."""
-        files = getattr(self, "_files", None) or []
-        if not files or any(fp.binary or fp.old is None or fp.new is None or fp.old != fp.new
-                            or not (fp.path or "").endswith(".py")
-                            or not (fp.path or "").startswith(("sqlglot/", "tests/"))
-                            for fp in files):
+        if not self._only_py_edits():
             return False  # only edits to existing modules: the copy in memory is complete
-        if not hasattr(os, "fork") or len(self._patched) != len(files):
-            return False
         sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
         if len(sel) > CHECK_RUN_MAX_TESTS:
             return False
@@ -1529,6 +1591,9 @@ class Selector:
             log(f"  unknown ({why}): all tests")
             bits = self.all_bits
         else:
+            mx = self.by_id.get(MAX_NODES_ID)
+            if mx is not None and bits >> mx & 1 and self._max_nodes_drops(bits, mx):
+                bits &= ~(1 << mx)
             if bits and self._check_run_pays(bits):
                 bits = 0
         out = []
