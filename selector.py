@@ -38,25 +38,7 @@ MAPS = APP / "maps"
 MAX_WORKERS = 8
 IMPORT_CHECK_FANOUT = 8
 STATE_CHECK_MIN_GAIN_MS = 3000
-ZYGOTE_MAX_MODULES = 40
-MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"  # 28.8 s in the pinned suite
-MAX_NODES_MIN_GAIN_MS = 4000
-LONG_CHECK_MIN_GAIN_MS = 1000  # check-run one long test when the saving beats its cost by this
-RUN_COST_S = {  # CPU to run these tests alone, measured once at the pinned commit
-    'tests/test_executor.py::TestExecutor::test_agg_order': 1.494,
-    'tests/test_generator.py::TestGenerator::test_generator_memory': 1.794,
-    'tests/test_optimizer.py::TestOptimizer::test_annotate_funcs': 0.833,
-    'tests/test_optimizer.py::TestOptimizer::test_canonicalize': 0.057,
-    'tests/test_optimizer.py::TestOptimizer::test_merge_subqueries': 0.517,
-    'tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls': 0.816,
-    'tests/test_optimizer.py::TestOptimizer::test_qualify_columns': 0.807,
-    'tests/test_optimizer.py::TestOptimizer::test_scope': 1.306,
-    'tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries': 0.294,
-}
-
-CHECK_RUN_MAX_TESTS = 60       # run a selection on the patched sources only if it is this small
-CHECK_RUN_OVERHEAD_MS = 900    # fresh sqlglot import + test modules in the check-run child
-CHECK_RUN_MIN_GAIN_MS = 500    # and only when the expected saving beats its CPU by this much  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
+ZYGOTE_MAX_MODULES = 40  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
 
 
@@ -932,105 +914,6 @@ def _state_in_child(texts, only=None):
     return json.loads(data.decode())
 
 
-def _max_nodes_standin():
-    """tests/test_parser.py::TestParser::test_max_nodes at 1/25 scale: the same
-    statements and assertions with the width and both node limits divided by 25."""
-    from sqlglot import exp, parse_one
-    from sqlglot.errors import ParseError
-    assert isinstance(parse_one("SELECT 1", max_nodes=40_000), exp.Select)
-    cols = [f"col{i}" for i in range(500)]
-    assert isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=40_000), exp.Select)
-    expr = "x" + "=x" * 100
-    sql = "SELECT " + ",".join(expr for _ in range(400))
-    for limit, text in ((40_000, "Maximum number of AST nodes"), (2_000, "(2000)")):
-        try:
-            parse_one(sql, max_nodes=limit)
-        except ParseError as error:
-            assert text in str(error)
-        else:
-            raise AssertionError("no ParseError")
-    try:
-        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
-    except ParseError:
-        pass
-    else:
-        raise AssertionError("no ParseError")
-    assert isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
-
-
-def _check_run(texts, test_ids, budget_s, standin=False):
-    """Fork; run the given tests (unittest, as in the scored suite) on the patched
-    sources served from memory. True only if every test passes: any failure, error,
-    skip, import problem, timeout or crash counts as 'not proven'."""
-    import importlib
-    import importlib.abc
-    import importlib.util
-    import signal
-    sys.stdout.flush()
-    sys.stderr.flush()
-    pid = os.fork()
-    if pid == 0:
-        code = 3
-        try:
-            # imported only here: sqlglot records at import whether unittest is loaded
-            # (expressions.core.UNITTEST), so the parent must never import it
-            import unittest
-            fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(fd, 1)
-            os.dup2(fd, 2)
-            signal.alarm(max(1, int(budget_s)))
-            os.environ["SKIP_INTEGRATION"] = "0"
-            for n in [n for n in sys.modules if n.split(".")[0] in ("sqlglot", "tests")]:
-                del sys.modules[n]
-            if str(SRC) not in sys.path:
-                sys.path.insert(0, str(SRC))
-            sys.dont_write_bytecode = True
-            os.chdir(str(SRC))
-            by_name = {}
-
-            class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-                def find_spec(self, name, path, target=None):
-                    rel = name.replace(".", "/")
-                    for cand in (rel + ".py", rel + "/__init__.py"):
-                        if cand in texts:
-                            by_name[name] = cand
-                            sub = [str(SRC / rel)] if cand.endswith("__init__.py") else None
-                            return importlib.util.spec_from_file_location(
-                                name, str(SRC / cand), loader=self, submodule_search_locations=sub)
-                    return None
-
-                def create_module(self, spec):
-                    return None
-
-                def exec_module(self, module):
-                    rel = by_name[module.__name__]
-                    exec(compile(texts[rel], module.__spec__.origin, "exec", dont_inherit=True), module.__dict__)
-
-            sys.meta_path.insert(0, Finder())
-            if standin:
-                _max_nodes_standin()
-                os._exit(0)
-            suite = unittest.TestSuite()
-            for tid in test_ids:
-                parts = tid.split("::")
-                mod = importlib.import_module(parts[0][:-3].replace("/", "."))
-                obj = mod
-                for part in parts[1:-1]:
-                    obj = getattr(obj, part)
-                suite.addTest(obj(parts[-1]))
-            result = unittest.TestResult()
-            suite.run(result)
-            ok = (result.testsRun == len(test_ids) and not result.failures and not result.errors
-                  and not result.skipped and not result.unexpectedSuccesses)
-            code = 0 if ok else 1
-        except BaseException:
-            code = 3
-        finally:
-            os._exit(code)
-    _, status = os.waitpid(pid, 0)
-    return os.waitstatus_to_exitcode(status) == 0
-
-
 def _import_differential(patched, importers):
     """False only when the patched modules raise and the same run with pristine text does not."""
     paths = sorted(patched)
@@ -1253,84 +1136,6 @@ class Selector:
         import-time value (module/class attributes, defaults, closures) as it was?"""
         return self._changed_state() == set()
 
-    def _only_py_edits(self):
-        files = getattr(self, "_files", None) or []
-        return bool(files) and hasattr(os, "fork") and len(self._patched) == len(files) and not any(
-            fp.binary or fp.old is None or fp.new is None or fp.old != fp.new
-            or not (fp.path or "").endswith(".py") or not (fp.path or "").startswith(("sqlglot/", "tests/"))
-            for fp in files)
-
-    def _max_nodes_drops(self, bits, mx):
-        """test_max_nodes (28.8 s) is selected by most parser edits and almost never
-        fails. Run a 1/25-scale stand-in on the patched sources; drop the test when it
-        passes and is not much slower than the same stand-in on the pinned sources
-        (an edit that slows parsing would time the real test out)."""
-        if not self._only_py_edits():
-            return False
-        if self._est_cost(bits) - self._est_cost(bits & ~(1 << mx)) < MAX_NODES_MIN_GAIN_MS:
-            return False
-        if any(p.startswith("tests/test_parser") for p in self._patched):
-            return False  # the test itself changed
-        try:
-            import resource
-
-            def timed(texts):
-                r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-                ok = _check_run(texts, [], budget_s=20, standin=True)
-                r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-                return ok, (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime)
-
-            if getattr(Selector, "_standin_base", None) is None:
-                ok, t = timed({})
-                Selector._standin_base = t if ok else 0
-            if not Selector._standin_base:
-                return False
-            ok, t = timed(self._patched)
-            return ok and t <= 1.5 * Selector._standin_base + 0.3
-        except Exception:
-            return False
-
-    def _check_longest(self, bits):
-        """The longest selected test often sets the busiest worker on its own (for
-        example test_generator_memory: 6.7 s recorded, under 2 s to run). When dropping
-        it would save more than running it costs, run that one test on the patched
-        sources and drop it if it passes."""
-        if not self._only_py_edits():
-            return bits
-        id_of = {t["number"]: t["id"] for t in self.tests}
-        sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
-        longest = max(sel, key=lambda n: self.dur[n])
-        tid = id_of[longest]
-        if tid not in RUN_COST_S:
-            return bits
-        gain = self._est_cost(bits) - self._est_cost(bits & ~(1 << longest))
-        if gain - (CHECK_RUN_OVERHEAD_MS + 1500 * RUN_COST_S[tid]) < LONG_CHECK_MIN_GAIN_MS:
-            return bits
-        try:
-            if _check_run(self._patched, [tid], budget_s=10 + 3 * RUN_COST_S[tid]):
-                return bits & ~(1 << longest)
-        except Exception:
-            pass
-        return bits
-
-    def _check_run_pays(self, bits):
-        """For a small, cheap selection: run it on the patched sources; if every test
-        passes, nothing this commit selects can fail, so nothing needs to run."""
-        if not self._only_py_edits():
-            return False  # only edits to existing modules: the copy in memory is complete
-        sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
-        if len(sel) > CHECK_RUN_MAX_TESTS:
-            return False
-        run_ms = sum(self.dur[n] for n in sel)
-        if self._est_cost(bits) - (CHECK_RUN_OVERHEAD_MS + 1.5 * run_ms) < CHECK_RUN_MIN_GAIN_MS:
-            return False
-        id_of = {t["number"]: t["id"] for t in self.tests}
-        ids = [id_of[n] for n in sel]
-        try:
-            return _check_run(self._patched, ids, budget_s=5 + 3 * run_ms / 1000)
-        except Exception:
-            return False
-
     def _est_cost(self, bits):
         """Busiest worker + worker fee of the packing `pack` would choose, in ms."""
         sel = []
@@ -1510,7 +1315,6 @@ class Selector:
                 if hl[:1] in " -":
                     o += 1
         class_names = {rg[1] for rg in regions if rg[0] == "c"}
-        used = []
         for name, r in removed:
             owner = None  # qualname of the class the removed name belongs to
             if r >= 0:
@@ -1526,31 +1330,16 @@ class Selector:
             pat = re.compile(r"\b%s\b" % re.escape(name))
             # search the tree as it is after the whole patch: a commit that removes
             # a helper together with its callers leaves nothing that refers to it
-            patched = getattr(self, "_patched", {}) or {}
+            patched = getattr(self, "_patched", {})
             for rel, text in self._source_files():
-                new_text = patched.get(rel, text)
-                if pat.search(new_text):
-                    if rel in patched and not pat.search(text):
-                        raise Unknown(f"removed name {name} newly used in {rel}")
-                    used.append(name)
-                    break
+                text = patched.get(rel, text)
+                if pat.search(text):
+                    if rel == path:
+                        raise Unknown(f"removed name {name} still used in its module")
+                    raise Unknown(f"removed name {name} used in {rel}")
             for rel, text in patched.items():
                 if rel not in self._source_paths() and pat.search(text):
                     raise Unknown(f"removed name {name} used in new file {rel}")
-        if not used:
-            return 0
-        # Still referenced. If the patched package imports without any new failure, the
-        # name breaks only the code that runs a line naming it: those lines' tests.
-        changed = self._changed_state()
-        if changed is None or "FAILED" in changed:
-            raise Unknown(f"removed name {used[0]} still used")
-        out = 0
-        for name in used:
-            if any(name in line and "lambda" in line
-                   for _rel, text in self._source_files() for line in text.split("\n")):
-                raise Unknown(f"removed name {name} used in a lambda")
-            out |= self._name_readers(name)
-        return out
 
     # -- per file kinds ----------------------------------------------------
 
@@ -1600,10 +1389,9 @@ class Selector:
             # commit, i.e. only an existing signature or class line was rewritten
             old_names, new_names = _def_names(old_text), _def_names(new_text)
             added_def = old_names is None or new_names is None or not new_names <= old_names
-        removed_users = 0
         if not is_test:
-            removed_users = self.check_removed_names(fp, path, old_text, reg, regions)
-        out = removed_users
+            self.check_removed_names(fp, path, old_text, reg, regions)
+        out = 0
         wide = 0  # class-user widening, replaced by attribute readers when they are known
         import_time = added_def
         runs_on_import = added_def
@@ -1711,6 +1499,7 @@ class Selector:
         # about a CPU second: run it only when the broad selection costs clearly more
         worth_checking = self._est_cost(broad) - self._est_cost(out) > STATE_CHECK_MIN_GAIN_MS
         if (wide or import_time) and not is_test and not added_def and worth_checking \
+                and not path.endswith("__init__.py") \
                 and not any("lambda" in c for c in _changed_lines(fp)):
             # import-time state: instead of every user of the class (and the module's
             # family), the tests that read the values the patch actually changes
@@ -1769,7 +1558,6 @@ class Selector:
             raise Unknown("empty patch")
         out = 0
         self._patched = self._patched_texts(files)
-        self._files = files
         self._import_verdict = None
         self._state_done = False
         self._state_changed = None
@@ -1797,25 +1585,11 @@ class Selector:
         return out
 
     def select(self, patch_text):
-        self._patched = None  # never reuse the previous commit's sources
-        self._files = None
         try:
             bits = self.select_bits(patch_text)
         except Unknown as why:
             log(f"  unknown ({why}): all tests")
             bits = self.all_bits
-            mx = self.by_id.get(MAX_NODES_ID)
-            if mx is not None and getattr(self, "_patched", None) is not None \
-                    and self._max_nodes_drops(bits, mx):
-                bits &= ~(1 << mx)
-        else:
-            mx = self.by_id.get(MAX_NODES_ID)
-            if mx is not None and bits >> mx & 1 and self._max_nodes_drops(bits, mx):
-                bits &= ~(1 << mx)
-            if bits and self._check_run_pays(bits):
-                bits = 0
-            elif bits:
-                bits = self._check_longest(bits)
         out = []
         n = 0
         while bits:
