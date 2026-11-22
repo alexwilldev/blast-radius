@@ -466,6 +466,65 @@ def _ast_equal(a, b):
     return _code_equal(ca, cb)
 
 
+def _def_names(text):
+    """Qualified names of every def and class in a module (None if it does not parse);
+    a name defined twice counts as new, since the second definition replaces the first."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    out, seen = set(), set()
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + child.name
+                out.add(name + ("#2" if name in seen else ""))
+                seen.add(name)
+                visit(child, name + ".")
+            else:
+                visit(child, prefix)
+
+    visit(tree, "")
+    return out
+
+
+def _def_headers(text):
+    """{qualname: header of each def with its annotations left out}, or None unless the
+    module has `from __future__ import annotations` (then annotations stay unevaluated
+    strings, so an annotation-only edit of a signature changes no behaviour)."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    if not any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
+               and any(a.name == "annotations" for a in n.names) for n in tree.body):
+        return None
+    out = {}
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + child.name
+                if not isinstance(child, ast.ClassDef):
+                    a = child.args
+                    args = [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs]
+                    extra = [x.arg if x else None for x in (a.vararg, a.kwarg)]
+                    out[name] = ast.dump(ast.Tuple(
+                        elts=[ast.Constant(type(child).__name__), ast.Constant(repr(args)),
+                              ast.Constant(repr(extra)), ast.Constant(len(a.posonlyargs)),
+                              ast.Constant(len(a.kwonlyargs))]
+                        + child.decorator_list + a.defaults
+                        + [d if d is not None else ast.Constant(None) for d in a.kw_defaults]
+                        + list(getattr(child, "type_params", []) or []), ctx=ast.Load()))
+                visit(child, name + ".")
+            else:
+                visit(child, prefix)
+
+    visit(tree, "")
+    return out
+
+
 _ENUM_BASES = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "AutoName"}
 _enum_cache = {}
 
@@ -1173,6 +1232,7 @@ class Selector:
                     if base and new and "STALE" not in base and "STALE" not in new:
                         changed = {k for k in set(base) | set(new) if base.get(k) != new.get(k)}
                         self._state_base = base
+                        self._state_new = new
                 if changed is None:
                     if getattr(Selector, "_pristine_state", None) is None:
                         Selector._pristine_state = _state_in_child({}) or {}
@@ -1181,6 +1241,7 @@ class Selector:
                     if new is not None:
                         changed = {k for k in set(base) | set(new) if base.get(k) != new.get(k)}
                         self._state_base = base
+                        self._state_new = new
             except Exception:
                 changed = None
         self._state_done = True
@@ -1300,6 +1361,72 @@ class Selector:
                     out |= self.maps.line(rel, i)
         return out
 
+    def _new_value_readers(self, key, new):
+        """A data value that did not exist at the pinned commit (a new class setting or
+        module constant). Pinned code that reads that name now gets it: through a class
+        attribute the readers of every same-named attribute of any class (a subclass
+        setting shadows its parent's), and the lines naming it (module globals, and
+        builtins or star-imported names it may shadow). New code that reads it is in the
+        patch, whose touched lines select on their own. None for anything callable."""
+        if new is None or not new.endswith(":d"):
+            return None
+        if key.startswith("G|"):
+            return self._name_readers(key.rsplit("|", 1)[1])
+        if "::" not in key:
+            return None
+        if "[" in key:
+            # an entry of a dict: covered by the dict itself when the whole dict is new
+            whole = key[:key.index("[")]
+            return 0 if whole not in self._state_base and whole in self._state_new else None
+        name = key.rsplit(".", 1)[1]
+        out = self._name_readers(name)
+        maps = self.maps
+        maps.attr_readers("__unreliable__")  # loads the index
+        tail = "." + name
+        for k in maps._attrs:
+            if k.endswith(tail):
+                out |= maps.attr_readers(k) or 0
+        return out
+
+    def _method_callers(self, key, new):
+        """A method defined in a class body was removed, redefined or re-decorated
+        (state key "sqlglot/x.py::Cls.meth", old value a function). Only a test that
+        called it at the pinned commit (ran a line of its body) can see the difference:
+        generator dispatch (`<key>_sql` found through dir()) calls it, and every
+        import-time table derived from it is a state key of its own in the same diff.
+        None when the old value is not a multi-line def of that class in that file."""
+        if new is not None and not new.endswith(":f"):
+            return None
+        if key.startswith("G|"):
+            # a module-level function (its defaults or closure changed, or it was
+            # removed), seen in the module that defines it and in every module that
+            # imported it by name: the callers of the def, wherever it is defined
+            _g, rel0, name = key.split("|", 2)
+            homes = [rel0] + sorted({k.split("|", 2)[1] for k in (self._state_changed or ())
+                                     if k.startswith("G|") and k.rsplit("|", 1)[1] == name} - {rel0})
+            for rel in homes:
+                st = self.maps.struct(rel)
+                if st is None:
+                    continue
+                for kind, qual, start, end, body in st["regions"]:
+                    if kind == "d" and qual == name:
+                        if body <= start or body > end:
+                            return None
+                        return self.maps.lines(rel, body, end)
+            return None
+        if "::" not in key:
+            return None
+        rel, qual = key.split("::", 1)
+        st = self.maps.struct(rel)
+        if st is None:
+            return None
+        for kind, name, start, end, body in st["regions"]:
+            if kind == "d" and name == qual:
+                if body <= start or body > end:
+                    return None  # one-line def: its body shares the def line
+                return self.maps.lines(rel, body, end)
+        return None
+
     def _readers_of_changes(self):
         """Tests that read an import-time value this commit changes, or None when a
         changed value cannot be mapped to its readers (then the caller widens)."""
@@ -1310,6 +1437,10 @@ class Selector:
         new_kind = {}
         out = 0
         maps = self.maps
+        # nothing in sqlglot or its tests reads class annotations at run time; what a
+        # decorator derives from them (dataclass fields, __init__) is a state key of its
+        # own in the same diff
+        changed = {k for k in changed if k.startswith("G|") or ".__annotations__" not in k}
         keyed = {}  # dict attribute -> changed entries
         for key in changed:
             if key.endswith("]") and "[" in key and not key.startswith("G|"):
@@ -1321,9 +1452,17 @@ class Selector:
                 continue
             old = base.get(key)
             if old is None:
-                return None  # a new attribute or global: who reads it is unknown
+                readers = self._new_value_readers(key, self._state_new.get(key))
+                if readers is None:
+                    return None  # a new attribute or global: who reads it is unknown
+                out |= readers
+                continue
             if not old.endswith(":d"):
-                return None  # a function, descriptor or class: defaults/closures changed
+                callers = self._method_callers(key, self._state_new.get(key))
+                if callers is None:
+                    return None  # a function, descriptor or class: defaults/closures changed
+                out |= callers
+                continue
             if key.startswith("G|"):
                 out |= self._name_readers(key.rsplit("|", 1)[1])
                 continue
@@ -1453,7 +1592,14 @@ class Selector:
         header = set()
         for rg in regions:
             header.update(range(rg[2], rg[4]))
-        added_def = any(c.lstrip().startswith(("def ", "async def ", "class ", "@")) for c in _added_lines(fp))
+        added_def = any(c.lstrip().startswith("@") for c in _added_lines(fp))
+        if not added_def and any(c.lstrip().startswith(("def ", "async def ", "class "))
+                                 for c in _added_lines(fp)):
+            # a def/class line was added: a new definition unless every def and class
+            # of the patched file already exists (same qualified name) at the pinned
+            # commit, i.e. only an existing signature or class line was rewritten
+            old_names, new_names = _def_names(old_text), _def_names(new_text)
+            added_def = old_names is None or new_names is None or not new_names <= old_names
         removed_users = 0
         if not is_test:
             removed_users = self.check_removed_names(fp, path, old_text, reg, regions)
@@ -1465,6 +1611,16 @@ class Selector:
         at_import = set(maps.import_lines(path))
         class_names = {rg[1] for rg in regions if rg[0] == "c"}
         classes_hit = set()
+
+        headers = []
+
+        def same_header(qual):
+            if not headers:
+                headers.append((_def_headers(old_text), _def_headers(new_text)))
+            old_h, new_h = headers[0]
+            if old_h is None or new_h is None:
+                return False
+            return qual in old_h and old_h.get(qual) == new_h.get(qual)
 
         def enclosing_class(r):
             name = regions[r][1]
@@ -1520,6 +1676,10 @@ class Selector:
             elif ln == body - 1 and ln not in removed and ln + 1 in touched:
                 # unchanged last header line, touched only as the neighbour of an
                 # insertion at the top of the body: the body lines carry the change
+                pass
+            elif ln < body and kind == "d" and same_header(name):
+                # only annotations changed (unevaluated strings): the body lines and
+                # coverage of this line carry whatever else changed
                 pass
             elif ln < body:  # decorator or signature: affects every call
                 out |= maps.lines(path, body, end)
