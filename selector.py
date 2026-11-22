@@ -1534,7 +1534,6 @@ class Selector:
         # about a CPU second: run it only when the broad selection costs clearly more
         worth_checking = self._est_cost(broad) - self._est_cost(out) > STATE_CHECK_MIN_GAIN_MS
         if (wide or import_time) and not is_test and not added_def and worth_checking \
-                and not path.endswith("__init__.py") \
                 and not any("lambda" in c for c in _changed_lines(fp)):
             # import-time state: instead of every user of the class (and the module's
             # family), the tests that read the values the patch actually changes
@@ -1621,11 +1620,17 @@ class Selector:
         return out
 
     def select(self, patch_text):
+        self._patched = None  # never reuse the previous commit's sources
+        self._files = None
         try:
             bits = self.select_bits(patch_text)
         except Unknown as why:
             log(f"  unknown ({why}): all tests")
             bits = self.all_bits
+            mx = self.by_id.get(MAX_NODES_ID)
+            if mx is not None and getattr(self, "_patched", None) is not None \
+                    and self._max_nodes_drops(bits, mx):
+                bits &= ~(1 << mx)
         else:
             mx = self.by_id.get(MAX_NODES_ID)
             if mx is not None and bits >> mx & 1 and self._max_nodes_drops(bits, mx):
