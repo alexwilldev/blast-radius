@@ -37,7 +37,8 @@ STRUCT = Path(os.environ.get("BR_STRUCT", APP / "struct"))
 MAPS = APP / "maps"
 MAX_WORKERS = 8
 IMPORT_CHECK_FANOUT = 8
-STATE_CHECK_MIN_GAIN_MS = 3000  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
+STATE_CHECK_MIN_GAIN_MS = 3000
+ZYGOTE_MAX_MODULES = 40  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
 
 
@@ -552,16 +553,30 @@ def _run_module(path, text):
         setattr(sys.modules[pkg], leaf, mod)
 
 
-def _load_pristine(paths):
-    """Import the pristine modules (and so their dependencies) into this process, once."""
+_ALL_LOADED = [False]
+
+
+def _load_pristine(paths, every=False):
+    """Import the pristine modules (and so their dependencies) into this process, once.
+    every=True: all of sqlglot (failures ignored), for the state check's zygote."""
     import importlib
     import io
     import contextlib
+    if every and _ALL_LOADED[0]:
+        return
     if str(SRC) not in sys.path:
         sys.path.insert(0, str(SRC))
     sys.dont_write_bytecode = True
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        if every:
+            for m in _all_module_names():
+                try:
+                    importlib.import_module(m)
+                except Exception:
+                    pass
+            _ALL_LOADED[0] = True
+            return
         for p in paths:
             importlib.import_module(_modname(p))
 
@@ -601,7 +616,7 @@ def _all_module_names():
     return out
 
 
-def _state_items(failed):
+def _state_items(failed, only=None):
     """Deterministic text of every value sqlglot computed while being imported:
     module and class attributes, function defaults and closures, recursively.
     Functions and classes count by name (their code is covered by coverage)."""
@@ -684,7 +699,8 @@ def _state_items(failed):
         return ":d"
 
     out = {"FAILED": ",".join(sorted(failed))}
-    for name in sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")):
+    for name in sorted(n for n in sys.modules if (n == "sqlglot" or n.startswith("sqlglot."))
+                       and (only is None or n in only)):
         mod = sys.modules[name]
         f = getattr(mod, "__file__", None) or ""
         i = f.rfind("/sqlglot/")
@@ -709,7 +725,40 @@ def _state_items(failed):
     return out
 
 
-def _state_in_child(texts):
+def _stale_refs(fresh):
+    """After re-importing the modules in `fresh` on top of a loaded package: does any
+    other sqlglot module still hold an object (class or function) from their old
+    versions? That module depends on them in a way the static import graph missed."""
+    def current(obj):
+        mod = sys.modules.get(getattr(obj, "__module__", None) or "")
+        cur = mod
+        for part in getattr(obj, "__qualname__", "").split("."):
+            if part == "<locals>" or cur is None:
+                return None
+            cur = getattr(cur, part, None)
+        return cur
+
+    def check(v):
+        if isinstance(v, (type, types.FunctionType)) and getattr(v, "__module__", None) in fresh:
+            return current(v) is not v
+        return False
+
+    for name, mod in list(sys.modules.items()):
+        if mod is None or name in fresh or not (name == "sqlglot" or name.startswith("sqlglot.")):
+            continue
+        values = list(vars(mod).values())
+        for v in list(values):
+            if isinstance(v, type) and v.__module__ == name:
+                values.extend(vars(v).values())
+        for v in values:
+            items = list(v.values()) + list(v.keys()) if isinstance(v, dict) else \
+                list(v) if isinstance(v, (list, tuple, set, frozenset)) else []
+            if check(v) or any(check(x) for x in items):
+                return True
+    return False
+
+
+def _state_in_child(texts, only=None):
     """Fork; the child imports all of sqlglot from scratch (patched files from `texts`)
     and sends back a digest of the import-time state. None if the child failed."""
     import importlib
@@ -730,7 +779,8 @@ def _state_in_child(texts):
             os.dup2(fd, 2)
             signal.alarm(60)
             for n in [n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")]:
-                del sys.modules[n]
+                if only is None or n in only:
+                    del sys.modules[n]
             if str(SRC) not in sys.path:
                 sys.path.insert(0, str(SRC))
             sys.dont_write_bytecode = True
@@ -761,11 +811,17 @@ def _state_in_child(texts):
             sink = io.StringIO()
             with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                 for m in _all_module_names():
+                    if only is not None and m not in only:
+                        continue
                     try:
                         importlib.import_module(m)
                     except Exception as error:
                         failed.append(f"{m}:{type(error).__name__}")
-            payload = json.dumps(_state_items(failed), separators=(",", ":")).encode()
+            if only is not None and _stale_refs(only):
+                items = {"STALE": "1"}
+            else:
+                items = _state_items(failed, only)
+            payload = json.dumps(items, separators=(",", ":")).encode()
             view = memoryview(payload)
             while view:
                 n = os.write(w, view)
@@ -973,12 +1029,31 @@ class Selector:
                    if p.startswith("sqlglot/") and (SRC / p).exists()}
         if patched and hasattr(os, "fork"):
             try:
-                if getattr(Selector, "_pristine_state", None) is None:
-                    Selector._pristine_state = _state_in_child({}) or {}
-                base = Selector._pristine_state
-                new = _state_in_child(patched) if base else None
-                if new is not None:
-                    changed = {k for k in set(base) | set(new) if base.get(k) != new.get(k)}
+                closure = set(patched)
+                todo = list(patched)
+                while todo:
+                    for imp in self.maps.imports.get(todo.pop(), ()):
+                        if imp.startswith("sqlglot/") and imp not in closure:
+                            closure.add(imp)
+                            todo.append(imp)
+                if len(closure) <= ZYGOTE_MAX_MODULES:
+                    # re-import only the patched modules and their importers on top of
+                    # the loaded package, once with pristine and once with patched text
+                    only = {_modname(p) for p in closure}
+                    _load_pristine(sorted(SRC.joinpath("sqlglot").rglob("*.py")), every=True)
+                    base = _state_in_child({}, only)
+                    new = _state_in_child(patched, only) if base else None
+                    if base and new and "STALE" not in base and "STALE" not in new:
+                        changed = {k for k in set(base) | set(new) if base.get(k) != new.get(k)}
+                        self._state_base = base
+                if changed is None:
+                    if getattr(Selector, "_pristine_state", None) is None:
+                        Selector._pristine_state = _state_in_child({}) or {}
+                    base = Selector._pristine_state
+                    new = _state_in_child(patched) if base else None
+                    if new is not None:
+                        changed = {k for k in set(base) | set(new) if base.get(k) != new.get(k)}
+                        self._state_base = base
             except Exception:
                 changed = None
         self._state_done = True
@@ -1026,7 +1101,7 @@ class Selector:
         changed = self._changed_state()
         if changed is None or "FAILED" in changed:
             return None
-        base = Selector._pristine_state
+        base = self._state_base
         new_kind = {}
         out = 0
         maps = self.maps
