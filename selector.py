@@ -58,6 +58,11 @@ CHECK_RUN_MAX_TESTS = 60       # run a selection on the patched sources only if 
 CHECK_RUN_OVERHEAD_MS = 900    # fresh sqlglot import + test modules in the check-run child
 CHECK_RUN_MIN_GAIN_MS = 500    # and only when the expected saving beats its CPU by this much  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
+SHRINK_MAX_TESTS = 700     # larger selections: run the faithful part, keep what fails
+SHRINK_OVERHEAD_MS = 1200
+SHRINK_CPU_RATIO = 0.4     # measured in-process CPU / recorded seconds: 0.30, 0.33, 0.57
+SHRINK_MIN_GAIN_MS = 500
+SHRINK_TOTAL_S = 25        # at most this much wall time on these checks per run
 
 
 def log(*args):
@@ -1031,6 +1036,98 @@ def _check_run(texts, test_ids, budget_s, standin=False):
     return os.waitstatus_to_exitcode(status) == 0
 
 
+def _check_run_failures(texts, test_ids, budget_s):
+    """Like _check_run, but report which tests did not pass: the set of ids that
+    failed, errored, were skipped or never ran; None when the run itself broke
+    (import error, timeout, crash), in which case nothing was proven."""
+    import json as _json
+    import signal
+    rfd, wfd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        code = 3
+        try:
+            import site
+            site.main()  # the image runs python -S; test files need site-packages (pytz)
+            import unittest
+            import importlib
+            import importlib.abc
+            import importlib.util
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            signal.alarm(max(1, int(budget_s)))
+            os.environ["SKIP_INTEGRATION"] = "0"
+            for n in [n for n in sys.modules if n.split(".")[0] in ("sqlglot", "tests")]:
+                del sys.modules[n]
+            if str(SRC) not in sys.path:
+                sys.path.insert(0, str(SRC))
+            sys.dont_write_bytecode = True
+            os.chdir(str(SRC))
+            by_name = {}
+
+            class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+                def find_spec(self, name, path, target=None):
+                    rel = name.replace(".", "/")
+                    for cand in (rel + ".py", rel + "/__init__.py"):
+                        if cand in texts:
+                            by_name[name] = cand
+                            sub = [str(SRC / rel)] if cand.endswith("__init__.py") else None
+                            return importlib.util.spec_from_file_location(
+                                name, str(SRC / cand), loader=self, submodule_search_locations=sub)
+                    return None
+
+                def create_module(self, spec):
+                    return None
+
+                def exec_module(self, module):
+                    rel = by_name[module.__name__]
+                    exec(compile(texts[rel], module.__spec__.origin, "exec", dont_inherit=True), module.__dict__)
+
+            sys.meta_path.insert(0, Finder())
+            bad = set()
+            for tid in test_ids:
+                parts = tid.split("::")
+                try:
+                    mod = importlib.import_module(parts[0][:-3].replace("/", "."))
+                    obj = mod
+                    for part in parts[1:-1]:
+                        obj = getattr(obj, part)
+                    case = obj(parts[-1])
+                except Exception:
+                    bad.add(tid)
+                    continue
+                result = unittest.TestResult()
+                case.run(result)
+                if (result.testsRun != 1 or result.failures or result.errors
+                        or result.skipped or result.unexpectedSuccesses):
+                    bad.add(tid)
+            os.write(wfd, _json.dumps(sorted(bad)).encode())
+            code = 0
+        except BaseException:
+            code = 3
+        finally:
+            os._exit(code)
+    os.close(wfd)
+    chunks = []
+    while True:
+        b = os.read(rfd, 65536)
+        if not b:
+            break
+        chunks.append(b)
+    os.close(rfd)
+    _, status = os.waitpid(pid, 0)
+    if os.waitstatus_to_exitcode(status) != 0:
+        return None
+    try:
+        return set(_json.loads(b"".join(chunks).decode()))
+    except ValueError:
+        return None
+
+
 def _import_differential(patched, importers):
     """False only when the patched modules raise and the same run with pristine text does not."""
     paths = sorted(patched)
@@ -1052,6 +1149,7 @@ def _import_differential(patched, importers):
 
 
 class Selector:
+    _shrink_spent = 0.0
     def __init__(self, tests):
         self.tests = tests
         self.all = [t["number"] for t in tests]
@@ -1321,6 +1419,49 @@ class Selector:
         except Exception:
             pass
         return bits
+
+    def _needs_missing_deps(self, test_id):
+        """Test files that import packages the image does not have (duckdb, pandas,
+        numpy): running them here only errors, so they are kept without a run."""
+        text = self._test_file_text(test_id.split("::", 1)[0]) or ""
+        return any(w in text for w in ("import duckdb", "import pandas", "import numpy",
+                                       "from duckdb", "from pandas", "from numpy"))
+
+    def _check_shrink(self, bits):
+        """Run the selected tests that can run faithfully here (no spawned processes,
+        no missing packages) on the patched sources and keep only those that do not
+        pass; everything else stays selected. Only when the expected saving beats the
+        run's CPU (about 0.6 x recorded seconds, measured, plus start-up)."""
+        if not self._only_py_edits():
+            return bits
+        id_of = {t["number"]: t["id"] for t in self.tests}
+        sel = [n for n in range(bits.bit_length()) if bits >> n & 1]
+        check = [n for n in sel if not self._spawns_workers(id_of[n]) and not self._needs_missing_deps(id_of[n])]
+        if not check or len(check) > SHRINK_MAX_TESTS:
+            return bits
+        keep = bits
+        for n in check:
+            keep &= ~(1 << n)
+        run_ms = sum(self.dur[n] for n in check)
+        if self._est_cost(bits) - self._est_cost(keep) - (SHRINK_OVERHEAD_MS + SHRINK_CPU_RATIO * run_ms) < SHRINK_MIN_GAIN_MS:
+            return bits
+        import time as _time
+        left = SHRINK_TOTAL_S - Selector._shrink_spent
+        if left < 2 + SHRINK_CPU_RATIO * run_ms / 1000:
+            return bits  # whole-run budget for these checks used up
+        t0 = _time.monotonic()
+        try:
+            bad = _check_run_failures(self._patched, [id_of[n] for n in check],
+                                      budget_s=min(left, 3 + 1.0 * run_ms / 1000))
+        except Exception:
+            bad = None
+        Selector._shrink_spent += _time.monotonic() - t0
+        if bad is None:
+            return bits
+        for n in check:
+            if id_of[n] in bad:
+                keep |= 1 << n
+        return keep
 
     def _check_run_pays(self, bits):
         """For a small, cheap selection: run it on the patched sources; if every test
@@ -1826,7 +1967,8 @@ class Selector:
             if bits and self._check_run_pays(bits):
                 bits = 0
             elif bits:
-                bits = self._check_longest(bits)
+                bits = self._check_shrink(bits)
+                bits = self._check_longest(bits) if bits else bits
         out = []
         n = 0
         while bits:

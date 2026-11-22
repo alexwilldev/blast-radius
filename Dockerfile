@@ -16,6 +16,10 @@ t.extractall('/app/src', members=ms, filter='data')" \
 # recompile sqlglot on every run in the read-only container.
 RUN python -m compileall -q /app/src/sqlglot && chmod -R a+rX /app/src
 
+# pytz (PyPI, pinned): tests/dialects/test_bigquery.py imports it, so without it a
+# check run that includes BigQuery tests cannot import them and proves nothing.
+RUN pip install --no-cache-dir pytz==2024.2
+
 # Structure maps (def/class/statement spans, import graph) from the pinned source.
 COPY build_struct.py /app/build_struct.py
 RUN python /app/build_struct.py /app/src /app/struct
