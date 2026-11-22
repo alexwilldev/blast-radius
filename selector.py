@@ -721,7 +721,17 @@ def _state_items(failed, only=None):
                 if isinstance(cv, type) and cv.__module__ == name and cv.__qualname__ == f"{c.__qualname__}.{ck}":
                     stack.append(cv)  # nested class: its own attributes
                     continue
-                out[f"{rel}::{c.__qualname__}.{ck}"] = h(walk(cv, 0)) + kind(cv)
+                key = f"{rel}::{c.__qualname__}.{ck}"
+                if type(cv) is dict and cv and all(" at 0x" not in repr(x) for x in cv):
+                    # per-key hashes, so one changed entry selects only who looked it up
+                    parts = []
+                    for dk, dv in cv.items():
+                        hk = h(walk(dv, 1))
+                        out[f"{key}[{repr(dk)}]"] = hk + ":d"
+                        parts.append(repr(dk) + "=" + hk)
+                    out[key] = h("dict:" + ",".join(sorted(parts))) + ":d"
+                else:
+                    out[key] = h(walk(cv, 0)) + kind(cv)
     return out
 
 
@@ -1105,7 +1115,15 @@ class Selector:
         new_kind = {}
         out = 0
         maps = self.maps
+        keyed = {}  # dict attribute -> changed entries
+        for key in changed:
+            if key.endswith("]") and "[" in key and not key.startswith("G|"):
+                attr = key[:key.index("[")]
+                if attr in base:
+                    keyed.setdefault(attr, []).append(key)
         for key in sorted(changed):
+            if key in keyed or (key.endswith("]") and key[:key.find("[")] in keyed):
+                continue
             old = base.get(key)
             if old is None:
                 return None  # a new attribute or global: who reads it is unknown
@@ -1118,6 +1136,19 @@ class Selector:
             if readers is None:
                 return None  # no recorder stood in for it
             out |= readers
+        for attr, entries in keyed.items():
+            if maps.attr_readers(attr + "{KEYED}") is None:
+                # the recorder did not watch this dict key by key: all its readers
+                readers = maps.attr_readers(attr)
+                if readers is None:
+                    return None
+                out |= readers
+                continue
+            # entries changed, added or removed: who looked those keys up (present or
+            # missing), plus whoever used the dict as a whole (iterated, copied, merged)
+            out |= maps.attr_readers(attr + "{ALL}") or 0
+            for e in entries:
+                out |= maps.attr_readers(e) or 0
         if changed:
             out |= maps.attr_readers("__unreliable__") or 0
         return out
