@@ -58,11 +58,11 @@ CHECK_RUN_MAX_TESTS = 60       # run a selection on the patched sources only if 
 CHECK_RUN_OVERHEAD_MS = 900    # fresh sqlglot import + test modules in the check-run child
 CHECK_RUN_MIN_GAIN_MS = 500    # and only when the expected saving beats its CPU by this much  # re-import only this many modules (patched + importers) per state check  # run the import-state check only if it can save this much  # re-run a patched module's importers only when it has this few
 WORKER_COST_MS = 2000
-SHRINK_MAX_TESTS = 700     # larger selections: run the faithful part, keep what fails
+SHRINK_MAX_TESTS = 2000    # larger selections: run the faithful part, keep what fails
 SHRINK_OVERHEAD_MS = 1200
-SHRINK_CPU_RATIO = 0.4     # measured in-process CPU / recorded seconds: 0.30, 0.33, 0.57
+SHRINK_CPU_RATIO = 0.3     # measured in-process CPU / recorded seconds: 0.30, 0.33, 0.57
 SHRINK_MIN_GAIN_MS = 500
-SHRINK_TOTAL_S = 25        # at most this much wall time on these checks per run
+SHRINK_TOTAL_S = 60        # at most this much wall time on these checks per run
 
 
 def log(*args):
@@ -1960,6 +1960,8 @@ class Selector:
             if mx is not None and getattr(self, "_patched", None) is not None \
                     and self._max_nodes_drops(bits, mx):
                 bits &= ~(1 << mx)
+            if getattr(self, "_patched", None) is not None:
+                bits = self._check_shrink(bits)
         else:
             mx = self.by_id.get(MAX_NODES_ID)
             if mx is not None and bits >> mx & 1 and self._max_nodes_drops(bits, mx):
